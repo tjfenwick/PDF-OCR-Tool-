@@ -70,6 +70,34 @@ Download the zip from the **Actions** tab → latest run → **Artifacts**,
 unzip anywhere on Windows, and run `PDF-OCR-Tool.exe`. No admin and no
 separate Tesseract install required.
 
+### First run on Windows — getting past SmartScreen
+
+Because the .exe is downloaded from the internet and not signed with a
+purchased code-signing certificate, the first launch on a fresh machine
+shows **"Windows protected your PC"** (Microsoft Defender SmartScreen).
+None of the fixes below require admin:
+
+- **Recommended — unblock the zip *before* extracting.**
+  Right-click `PDF-OCR-Tool-windows-x64.zip` → **Properties** → tick
+  **Unblock** → **OK**. Then extract and run. This strips the
+  Mark-of-the-Web from every file inside, so SmartScreen never fires.
+- **Or, on the SmartScreen dialog:** click the small **More info** link,
+  then the **Run anyway** button that appears. Per-user choice, no admin.
+- **Or, in PowerShell** after extraction (no admin):
+  ```powershell
+  Get-ChildItem -Recurse "C:\path\to\PDF-OCR-Tool" | Unblock-File
+  ```
+
+The build embeds Windows version info, so the dialog identifies the file
+as **"PDF OCR Tool"** published by **tjfenwick** rather than "Unknown".
+
+To verify the download is intact, check the SHA-256 against the published
+`PDF-OCR-Tool-windows-x64.zip.sha256` file:
+
+```powershell
+Get-FileHash PDF-OCR-Tool-windows-x64.zip -Algorithm SHA256
+```
+
 ### Option B – Build locally on Windows
 
 ```cmd
