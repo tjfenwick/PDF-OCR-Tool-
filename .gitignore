@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.venv/
+.venv-build/
+build/
+dist/
+*.spec.bak
+
+tesseract/
+
+# settings file lives in user home, but if anyone places one in-tree
+.pdf_ocr_gui_config.json
+*.zip
