@@ -181,6 +181,48 @@ def crop_image(img: Image.Image, crop: Tuple[int, int, int, int]) -> Image.Image
     return img.crop((l, t, max(l + 1, width - r), max(t + 1, height - b)))
 
 
+def deskew_image(img: Image.Image) -> Tuple[Image.Image, float]:
+    """Estimate page skew from dark-pixel orientation and rotate to flat.
+
+    Returns (rotated_image, applied_angle_degrees). Skips rotation when the
+    estimated angle is < 0.25 degrees or OpenCV is unavailable.
+    """
+    if cv2 is None or np is None:
+        return img, 0.0
+    arr = np.array(img.convert("L"))
+    inv = 255 - arr if arr.mean() > 127 else arr
+    coords = np.column_stack(np.where(inv > 50))
+    if coords.shape[0] < 200:
+        return img, 0.0
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    if abs(angle) < 0.25:
+        return img, 0.0
+    h, w = arr.shape
+    matrix = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    rotated = cv2.warpAffine(
+        arr, matrix, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    return Image.fromarray(rotated), float(angle)
+
+
+def denoise_image(img: Image.Image) -> Image.Image:
+    """Apply non-local-means denoising suited for OCR. No-op without OpenCV."""
+    if cv2 is None or np is None:
+        return img
+    arr = np.array(img.convert("L"))
+    out = cv2.fastNlMeansDenoising(
+        arr, None, h=10, templateWindowSize=7, searchWindowSize=21
+    )
+    return Image.fromarray(out)
+
+
 def preprocess_image(
     img: Image.Image,
     grayscale: bool = True,
@@ -191,10 +233,18 @@ def preprocess_image(
     invert: bool = False,
     dilate: int = 0,
     erode: int = 0,
+    deskew: bool = False,
+    denoise: bool = False,
 ) -> Image.Image:
     """Condition an image for OCR.  Uses PIL by default; OpenCV when needed."""
     if grayscale:
         img = img.convert("L")
+
+    if denoise:
+        img = denoise_image(img)
+
+    if deskew:
+        img, _angle = deskew_image(img)
 
     if contrast and abs(contrast - 1.0) > 1e-6:
         img = ImageEnhance.Contrast(img).enhance(contrast)
@@ -269,6 +319,30 @@ def tesseract_words(
             )
         )
     return words
+
+
+def tesseract_words_voting(
+    img: Image.Image, lang: str, oem: int, min_conf: float,
+    psms: Sequence[int] = (6, 4),
+) -> List[OCRWord]:
+    """Run Tesseract once per PSM in ``psms`` and return the variant whose
+    average word confidence is highest. Slower (≈Nx) but more robust on pages
+    where the default PSM mis-segments the layout.
+    """
+    best_words: List[OCRWord] = []
+    best_score: float = -1.0
+    for psm in psms:
+        try:
+            words = tesseract_words(img, lang, psm, oem, min_conf)
+        except Exception:
+            continue
+        if not words:
+            continue
+        score = sum(w.conf for w in words) / len(words)
+        if score > best_score:
+            best_score = score
+            best_words = words
+    return best_words
 
 
 # ===================================================================

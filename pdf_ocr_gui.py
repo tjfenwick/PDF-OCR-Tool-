@@ -174,6 +174,19 @@ class OcrSettings:
     open_when_done: bool = True
     show_notification: bool = True
 
+    # ---- enterprise / accuracy controls ----
+    workers: int = 0                    # 0 = auto pick
+    use_text_layer: bool = True         # skip OCR for pages with embedded text
+    deskew: bool = False
+    denoise: bool = False
+    best_accuracy: bool = False         # multi-PSM voting (~2x slower)
+    write_audit_log: bool = True
+    seen_welcome: bool = False
+    recent_files: List[str] = field(default_factory=list)
+    recent_folders: List[str] = field(default_factory=list)
+    watch_folder: str = ""
+    watch_interval_sec: int = 5
+
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "Default": {},
@@ -401,181 +414,237 @@ class CancelledError(Exception):
     pass
 
 
-def process_pdf_multi(
-    pdf_path: Path,
-    settings: OcrSettings,
-    log: Callable[[str], None],
-    progress: Callable[[int, int], None],
-    cancel_event: threading.Event,
-) -> Dict[str, Any]:
-    args = settings_to_args(settings)
-    if args.tesseract_path:
-        pytesseract.pytesseract.tesseract_cmd = args.tesseract_path
+# ---------------------------------------------------------------------------
+# Per-page worker — picklable, called either inline or via ProcessPoolExecutor
+# ---------------------------------------------------------------------------
+@dataclass
+class PageWorkItem:
+    pdf_path: str
+    pdf_password: str
+    page_index: int
+    total_pages: int
+    settings: OcrSettings
+    formats: List[str]
 
-    doc = fitz.open(pdf_path)
+
+@dataclass
+class PageWordRecord:
+    text: str
+    conf: float
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass
+class PageResult:
+    pdf_path: str
+    page_index: int
+    used_text_layer: bool
+    drawing_page: bool
+    is_error: bool
+    error: str
+    elapsed_sec: float
+
+    md_chunk: str
+    raw_text: str
+    pdf_page_bytes: bytes
+    words: List[PageWordRecord]
+    avg_conf: float
+    word_count: int
+    rendered_size: Tuple[int, int]
+    deskew_applied: bool
+
+
+def _ocr_page(item: PageWorkItem) -> PageResult:
+    """Run the full render → preprocess → OCR pipeline for one page.
+
+    Designed to be pickled and called inside a ProcessPoolExecutor worker.
+    All inputs/outputs are picklable; rendered/processed images stay inside
+    this worker (only the OCR text + word records flow back to the parent).
+    """
+    import time
+    t0 = time.perf_counter()
+    s = item.settings
+
+    if s.tesseract_path:
+        pytesseract.pytesseract.tesseract_cmd = s.tesseract_path
+
     try:
-        page_indices = ocr_engine.parse_pages(args.pages, len(doc))
-        if not page_indices:
-            page_indices = list(range(len(doc)))
-        crop = ocr_engine.parse_crop(args.crop)
-        formats = set(settings.output_formats)
+        doc = fitz.open(item.pdf_path)
+        if doc.needs_pass:
+            ok = doc.authenticate(item.pdf_password) if item.pdf_password else 0
+            if not ok:
+                return PageResult(
+                    pdf_path=item.pdf_path, page_index=item.page_index,
+                    used_text_layer=False, drawing_page=False,
+                    is_error=True, error="Password required or incorrect.",
+                    elapsed_sec=0.0,
+                    md_chunk="", raw_text="", pdf_page_bytes=b"",
+                    words=[], avg_conf=0.0, word_count=0,
+                    rendered_size=(0, 0), deskew_applied=False,
+                )
 
-        md_chunks: List[str] = [f"# OCR Output: {pdf_path.name}\n"]
-        md_chunks.append(
-            "<!-- Settings: "
-            f"render_scale={args.render_scale}, psm={args.psm}, oem={args.oem}, "
-            f"threshold={args.threshold}, threshold_value={args.threshold_value}, "
-            f"contrast={args.contrast}, sharpen={args.sharpen}, "
-            f"dilate={args.dilate}, erode={args.erode}, "
-            f"min_conf={args.min_conf}, noise_conf={args.noise_conf}, "
-            f"noise_alpha_ratio={args.noise_alpha_ratio}, "
-            f"row_tol={args.row_tol}, col_gap={args.col_gap}, "
-            f"crop={args.crop or 'none'}"
-            " -->\n"
-        )
+        try:
+            page = doc[item.page_index]
 
-        json_doc: Dict[str, Any] = {
-            "file": pdf_path.name,
-            "total_pages": len(doc),
-            "settings": {
-                k: v for k, v in vars(args).items() if k not in {"pdfs", "output"}
-            },
-            "pages": [],
-        }
-        csv_records: List[List[Any]] = [["page", "x", "y", "w", "h", "conf", "text"]]
-        pdf_page_bytes: List[bytes] = []
+            # --- 1. Text-layer fast path -----------------------------------
+            if s.use_text_layer:
+                embedded = page.get_text("text") or ""
+                alnum = sum(c.isalnum() for c in embedded)
+                if len(embedded) >= 50 and alnum >= 20:
+                    md_chunk = (
+                        f"\n## Page {item.page_index + 1}\n"
+                        "<!-- source: embedded text layer -->\n"
+                        + embedded.strip() + "\n"
+                    )
+                    pdf_bytes = b""
+                    if "searchable_pdf" in item.formats:
+                        # render the page once just for the searchable PDF
+                        rendered = ocr_engine.render_page(page, s.render_scale)
+                        try:
+                            pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                                rendered, lang=s.lang,
+                                config=f"--oem {s.oem} --psm {s.psm}",
+                                extension="pdf",
+                            )
+                        except Exception:
+                            pdf_bytes = b""
+                    return PageResult(
+                        pdf_path=item.pdf_path,
+                        page_index=item.page_index,
+                        used_text_layer=True,
+                        drawing_page=False,
+                        is_error=False, error="",
+                        elapsed_sec=time.perf_counter() - t0,
+                        md_chunk=md_chunk,
+                        raw_text=embedded,
+                        pdf_page_bytes=pdf_bytes,
+                        words=[],
+                        avg_conf=100.0,
+                        word_count=len(embedded.split()),
+                        rendered_size=(0, 0),
+                        deskew_applied=False,
+                    )
 
-        debug_dir = Path(args.debug_dir) if args.debug_dir else None
-        if debug_dir:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-        total = len(page_indices)
-        for idx, page_index in enumerate(page_indices):
-            if cancel_event.is_set():
-                raise CancelledError()
-
-            log(f"  page {page_index + 1}/{len(doc)} (rendering at {args.render_scale}x)")
-            progress(idx, total)
-
-            page = doc[page_index]
-            rendered = ocr_engine.render_page(page, args.render_scale)
+            # --- 2. OCR path -----------------------------------------------
+            crop = ocr_engine.parse_crop(s.crop or None)
+            rendered = ocr_engine.render_page(page, s.render_scale)
             rendered = ocr_engine.crop_image(rendered, crop)
+
+            deskew_applied = False
+            if s.deskew:
+                _, angle = ocr_engine.deskew_image(rendered)
+                deskew_applied = abs(angle) >= 0.25
+
             processed = ocr_engine.preprocess_image(
                 rendered,
-                grayscale=not args.no_grayscale,
-                contrast=args.contrast,
-                sharpen=args.sharpen,
-                threshold=args.threshold,
-                threshold_value=args.threshold_value,
-                invert=args.invert,
-                dilate=args.dilate,
-                erode=args.erode,
+                grayscale=not s.no_grayscale,
+                contrast=s.contrast,
+                sharpen=s.sharpen,
+                threshold=s.threshold,
+                threshold_value=s.threshold_value,
+                invert=s.invert,
+                dilate=s.dilate,
+                erode=s.erode,
+                deskew=s.deskew,
+                denoise=s.denoise,
             )
 
-            stem = f"{pdf_path.stem}_p{page_index + 1:02d}"
-            if debug_dir:
-                rendered.save(debug_dir / f"{stem}_rendered.png")
-                processed.save(debug_dir / f"{stem}_processed.png")
+            if s.best_accuracy:
+                words = ocr_engine.tesseract_words_voting(
+                    processed, s.lang, s.oem, s.min_conf, psms=(6, 4),
+                )
+            else:
+                words = ocr_engine.tesseract_words(
+                    processed, s.lang, s.psm, s.oem, s.min_conf,
+                )
 
-            words = ocr_engine.tesseract_words(
-                processed, args.lang, args.psm, args.oem, args.min_conf
-            )
-
-            # Searchable PDF: bake OCR text layer onto the original rendered image
-            if "searchable_pdf" in formats:
+            # Searchable PDF page
+            pdf_bytes = b""
+            if "searchable_pdf" in item.formats:
                 try:
                     pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-                        rendered, lang=args.lang,
-                        config=f"--oem {args.oem} --psm {args.psm}",
+                        rendered, lang=s.lang,
+                        config=f"--oem {s.oem} --psm {s.psm}",
                         extension="pdf",
                     )
-                    pdf_page_bytes.append(pdf_bytes)
-                except Exception as exc:
-                    log(f"    [warn] searchable PDF page failed: {exc}")
+                except Exception:
+                    pdf_bytes = b""
 
-            # Per-page CSV records
-            if "csv" in formats:
-                for w in words:
-                    csv_records.append(
-                        [page_index + 1, w.x, w.y, w.w, w.h, round(w.conf, 2), w.text]
+            # Raw text (always cheap; consumers may ignore it)
+            raw_text = ""
+            if s.save_raw or s.use_text_layer is False:
+                try:
+                    raw_text = pytesseract.image_to_string(
+                        processed, lang=s.lang,
+                        config=f"--oem {s.oem} --psm {s.psm} "
+                               "-c preserve_interword_spaces=1",
                     )
+                except Exception:
+                    raw_text = ""
 
-            # Per-page JSON records
-            if "json" in formats:
-                json_doc["pages"].append({
-                    "page": page_index + 1,
-                    "words": [
-                        {
-                            "text": w.text, "conf": round(w.conf, 2),
-                            "x": w.x, "y": w.y, "w": w.w, "h": w.h,
-                        }
-                        for w in words
-                    ],
-                })
+            md_chunk = f"\n## Page {item.page_index + 1}\n"
 
-            # Drawing page short-circuit
-            if ocr_engine.detect_drawing_page(words):
-                md_chunks.append(f"\n## Page {page_index + 1}\n")
-                md_chunks.append(
+            drawing = ocr_engine.detect_drawing_page(words)
+            if drawing:
+                md_chunk += (
                     "*This page appears to be a drawing/graphic with no "
                     "extractable table data.*\n"
                 )
-                if debug_dir:
-                    ocr_engine.save_confidence_csv(
-                        debug_dir / f"{stem}_confidence.csv", words
-                    )
-                continue
+            else:
+                rows = ocr_engine.group_words_into_rows(
+                    words, y_tolerance=s.row_tol,
+                )
+                page_md = ocr_engine.rows_to_markdown(
+                    rows,
+                    gap=s.col_gap,
+                    noise_conf=s.noise_conf,
+                    noise_alpha_ratio=s.noise_alpha_ratio,
+                    include_confidence_comments=s.confidence_comments,
+                )
+                md_chunk += page_md
 
-            rows = ocr_engine.group_words_into_rows(words, y_tolerance=args.row_tol)
-            page_md = ocr_engine.rows_to_markdown(
-                rows,
-                gap=args.col_gap,
-                noise_conf=args.noise_conf,
-                noise_alpha_ratio=args.noise_alpha_ratio,
-                include_confidence_comments=args.confidence_comments,
+            avg_conf = (
+                sum(w.conf for w in words) / len(words) if words else 0.0
             )
-            md_chunks.append(f"\n## Page {page_index + 1}\n")
-            md_chunks.append(page_md)
-
-            if args.save_raw and debug_dir:
-                raw_text = pytesseract.image_to_string(
-                    processed, lang=args.lang,
-                    config=f"--oem {args.oem} --psm {args.psm} "
-                           "-c preserve_interword_spaces=1",
+            word_records = [
+                PageWordRecord(
+                    text=w.text, conf=round(w.conf, 2),
+                    x=w.x, y=w.y, w=w.w, h=w.h,
                 )
-                (debug_dir / f"{stem}_raw.txt").write_text(raw_text, encoding="utf-8")
+                for w in words
+            ]
 
-            if debug_dir:
-                ocr_engine.save_confidence_csv(
-                    debug_dir / f"{stem}_confidence.csv", words
-                )
-
-        progress(total, total)
-
-        md_text = "\n".join(md_chunks).strip() + "\n"
-
-        outputs: Dict[str, Any] = {}
-        if "markdown" in formats:
-            outputs["markdown"] = md_text
-        if "text" in formats:
-            outputs["text"] = markdown_to_plain_text(md_text)
-        if "json" in formats:
-            outputs["json"] = json.dumps(json_doc, indent=2, ensure_ascii=False)
-        if "csv" in formats:
-            buf = io.StringIO()
-            import csv as _csv
-            writer = _csv.writer(buf)
-            for row in csv_records:
-                writer.writerow(row)
-            outputs["csv"] = buf.getvalue()
-        if "html" in formats:
-            outputs["html"] = markdown_to_html(md_text, title=pdf_path.name)
-        if "searchable_pdf" in formats:
-            outputs["searchable_pdf"] = _merge_pdf_pages(pdf_page_bytes)
-
-        return outputs
-    finally:
-        doc.close()
+            return PageResult(
+                pdf_path=item.pdf_path,
+                page_index=item.page_index,
+                used_text_layer=False,
+                drawing_page=drawing,
+                is_error=False, error="",
+                elapsed_sec=time.perf_counter() - t0,
+                md_chunk=md_chunk,
+                raw_text=raw_text,
+                pdf_page_bytes=pdf_bytes,
+                words=word_records,
+                avg_conf=avg_conf,
+                word_count=len(word_records),
+                rendered_size=rendered.size,
+                deskew_applied=deskew_applied,
+            )
+        finally:
+            doc.close()
+    except Exception as exc:
+        return PageResult(
+            pdf_path=item.pdf_path, page_index=item.page_index,
+            used_text_layer=False, drawing_page=False,
+            is_error=True, error=f"{type(exc).__name__}: {exc}",
+            elapsed_sec=time.perf_counter() - t0,
+            md_chunk="", raw_text="", pdf_page_bytes=b"",
+            words=[], avg_conf=0.0, word_count=0,
+            rendered_size=(0, 0), deskew_applied=False,
+        )
 
 
 def _merge_pdf_pages(pdf_page_bytes: List[bytes]) -> bytes:
@@ -584,6 +653,8 @@ def _merge_pdf_pages(pdf_page_bytes: List[bytes]) -> bytes:
     out = fitz.open()
     try:
         for blob in pdf_page_bytes:
+            if not blob:
+                continue
             sub = fitz.open(stream=blob, filetype="pdf")
             try:
                 out.insert_pdf(sub)
@@ -592,6 +663,232 @@ def _merge_pdf_pages(pdf_page_bytes: List[bytes]) -> bytes:
         return out.tobytes()
     finally:
         out.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-PDF orchestrator
+#
+# Builds work items for every page of one PDF, runs them serially or via the
+# shared ProcessPoolExecutor, then assembles the per-format outputs.
+# ---------------------------------------------------------------------------
+def process_pdf_multi(
+    pdf_path: Path,
+    pdf_password: str,
+    settings: OcrSettings,
+    log: Callable[[str], None],
+    progress: Callable[[int, int], None],
+    cancel_event: threading.Event,
+    executor: "Optional[Any]" = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run OCR on one PDF.
+
+    Returns ``(outputs, metrics)`` where outputs maps format key to file
+    contents and metrics describes the run for the audit log / validation
+    dashboard.
+    """
+    from concurrent.futures import as_completed
+    import time
+
+    s = settings
+    if s.tesseract_path:
+        pytesseract.pytesseract.tesseract_cmd = s.tesseract_path
+
+    doc = fitz.open(pdf_path)
+    if doc.needs_pass:
+        ok = doc.authenticate(pdf_password) if pdf_password else 0
+        if not ok:
+            doc.close()
+            raise RuntimeError(
+                f"{pdf_path.name} is password-protected and the supplied "
+                "password did not work."
+            )
+    try:
+        total_pages_doc = len(doc)
+        page_indices = ocr_engine.parse_pages(s.pages or None, total_pages_doc)
+        if not page_indices:
+            page_indices = list(range(total_pages_doc))
+    finally:
+        doc.close()
+
+    items = [
+        PageWorkItem(
+            pdf_path=str(pdf_path),
+            pdf_password=pdf_password,
+            page_index=i,
+            total_pages=total_pages_doc,
+            settings=s,
+            formats=list(s.output_formats),
+        )
+        for i in page_indices
+    ]
+
+    total = len(items)
+    results_by_index: Dict[int, PageResult] = {}
+
+    t0 = time.perf_counter()
+    if executor is None or total <= 1:
+        for idx, item in enumerate(items):
+            if cancel_event.is_set():
+                raise CancelledError()
+            progress(idx, total)
+            log(f"  page {item.page_index + 1}/{total_pages_doc}")
+            res = _ocr_page(item)
+            results_by_index[item.page_index] = res
+            _log_page_result(res, log)
+    else:
+        futures = {executor.submit(_ocr_page, item): item for item in items}
+        completed = 0
+        try:
+            for fut in as_completed(futures):
+                if cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    raise CancelledError()
+                res = fut.result()
+                results_by_index[res.page_index] = res
+                completed += 1
+                progress(completed, total)
+                log(f"  page {res.page_index + 1}/{total_pages_doc}")
+                _log_page_result(res, log)
+        finally:
+            pass
+
+    progress(total, total)
+    elapsed = time.perf_counter() - t0
+
+    # ---- assemble outputs in page order ------------------------------------
+    ordered = [results_by_index[i] for i in page_indices if i in results_by_index]
+    formats = set(s.output_formats)
+
+    md_chunks: List[str] = [f"# OCR Output: {pdf_path.name}\n"]
+    md_chunks.append(
+        "<!-- Settings: "
+        f"render_scale={s.render_scale}, psm={s.psm}, oem={s.oem}, "
+        f"threshold={s.threshold}, contrast={s.contrast}, "
+        f"deskew={s.deskew}, denoise={s.denoise}, "
+        f"best_accuracy={s.best_accuracy}, use_text_layer={s.use_text_layer}"
+        " -->\n"
+    )
+    csv_records: List[List[Any]] = [["page", "x", "y", "w", "h", "conf", "text"]]
+    pdf_page_bytes: List[bytes] = []
+    json_doc: Dict[str, Any] = {
+        "file": pdf_path.name,
+        "total_pages": total_pages_doc,
+        "settings": asdict(s),
+        "pages": [],
+    }
+
+    debug_dir = Path(s.debug_dir) if s.debug_dir else None
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    for res in ordered:
+        md_chunks.append(res.md_chunk)
+        if "csv" in formats:
+            for w in res.words:
+                csv_records.append([
+                    res.page_index + 1, w.x, w.y, w.w, w.h, w.conf, w.text,
+                ])
+        if "json" in formats:
+            json_doc["pages"].append({
+                "page": res.page_index + 1,
+                "used_text_layer": res.used_text_layer,
+                "drawing_page": res.drawing_page,
+                "avg_conf": round(res.avg_conf, 2),
+                "deskew_applied": res.deskew_applied,
+                "words": [
+                    {"text": w.text, "conf": w.conf,
+                     "x": w.x, "y": w.y, "w": w.w, "h": w.h}
+                    for w in res.words
+                ],
+            })
+        if res.pdf_page_bytes:
+            pdf_page_bytes.append(res.pdf_page_bytes)
+        if debug_dir and res.raw_text:
+            stem = f"{pdf_path.stem}_p{res.page_index + 1:02d}"
+            (debug_dir / f"{stem}_raw.txt").write_text(res.raw_text, encoding="utf-8")
+
+    md_text = "\n".join(md_chunks).strip() + "\n"
+
+    outputs: Dict[str, Any] = {}
+    if "markdown" in formats:
+        outputs["markdown"] = md_text
+    if "text" in formats:
+        outputs["text"] = markdown_to_plain_text(md_text)
+    if "json" in formats:
+        outputs["json"] = json.dumps(json_doc, indent=2, ensure_ascii=False)
+    if "csv" in formats:
+        buf = io.StringIO()
+        import csv as _csv
+        writer = _csv.writer(buf)
+        for row in csv_records:
+            writer.writerow(row)
+        outputs["csv"] = buf.getvalue()
+    if "html" in formats:
+        outputs["html"] = markdown_to_html(md_text, title=pdf_path.name)
+    if "searchable_pdf" in formats:
+        outputs["searchable_pdf"] = _merge_pdf_pages(pdf_page_bytes)
+
+    # ---- metrics for validation / audit ------------------------------------
+    ocr_pages = [r for r in ordered if not r.used_text_layer and not r.is_error]
+    text_layer_pages = [r for r in ordered if r.used_text_layer]
+    error_pages = [r for r in ordered if r.is_error]
+    avg_conf_overall = (
+        sum(r.avg_conf for r in ocr_pages) / len(ocr_pages)
+        if ocr_pages else 0.0
+    )
+    low_conf_pages = sorted(
+        [(r.page_index + 1, round(r.avg_conf, 1))
+         for r in ocr_pages if r.avg_conf < 70.0]
+    )
+    metrics: Dict[str, Any] = {
+        "pdf": str(pdf_path),
+        "elapsed_sec": round(elapsed, 2),
+        "total_pages_doc": total_pages_doc,
+        "pages_processed": len(ordered),
+        "pages_via_ocr": len(ocr_pages),
+        "pages_via_text_layer": len(text_layer_pages),
+        "pages_errored": len(error_pages),
+        "errors": [{"page": r.page_index + 1, "error": r.error} for r in error_pages],
+        "avg_confidence": round(avg_conf_overall, 2),
+        "low_confidence_pages": low_conf_pages,
+        "total_words": sum(r.word_count for r in ordered),
+        "page_metrics": [
+            {
+                "page": r.page_index + 1,
+                "source": "text-layer" if r.used_text_layer else "ocr",
+                "drawing": r.drawing_page,
+                "avg_conf": round(r.avg_conf, 2),
+                "words": r.word_count,
+                "elapsed_sec": round(r.elapsed_sec, 2),
+                "deskew_applied": r.deskew_applied,
+                "rendered_size": list(r.rendered_size),
+            }
+            for r in ordered
+        ],
+    }
+    # Keep ordered results around for the validation tab (page picker, preview)
+    metrics["_page_results"] = ordered
+    return outputs, metrics
+
+
+def _log_page_result(res: PageResult, log: Callable[[str], None]) -> None:
+    if res.is_error:
+        log(f"    ERROR: {res.error}")
+        return
+    if res.used_text_layer:
+        log(f"    used embedded text layer ({res.word_count} words)")
+        return
+    flags = []
+    if res.deskew_applied:
+        flags.append("deskewed")
+    if res.drawing_page:
+        flags.append("drawing")
+    extra = f"  [{', '.join(flags)}]" if flags else ""
+    log(
+        f"    OCR: {res.word_count} words, "
+        f"avg conf {res.avg_conf:.1f}, {res.elapsed_sec:.1f}s{extra}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +1082,15 @@ TOOLTIPS: Dict[str, str] = {
         "'left,top,right,bottom', e.g. '50,100,50,80' trims 50 px from each "
         "side, 100 from the top, 80 from the bottom. Useful to drop headers, "
         "footers, or borders. Leave blank for no crop.",
+    "deskew":
+        "Detects pages that are slightly tilted (common in scans where the "
+        "page wasn't perfectly aligned on the scanner) and rotates them to "
+        "be straight before OCR. Tilts under about a quarter of a degree "
+        "are left alone.",
+    "denoise":
+        "Removes speckle and graininess from low-quality scans before OCR. "
+        "Slower but improves accuracy on noisy pages. Has no effect on "
+        "clean digital PDFs.",
 
     # ---- Layout & Noise tab ----
     "row_tol":
@@ -817,6 +1123,38 @@ TOOLTIPS: Dict[str, str] = {
     "conf_comments":
         "Embed an HTML comment '<!-- OCR avg confidence: 87.3 -->' after "
         "each row in Markdown output. Helps identify rows OCR was unsure about.",
+    "audit_log":
+        "Write a small .json sidecar next to each output describing the run: "
+        "settings used, source SHA-256, per-page confidence, words found, "
+        "elapsed time, Tesseract version. Recommended for compliance and "
+        "for figuring out why an old output looked the way it did.",
+
+    # ---- Performance & accuracy (OCR tab) ----
+    "workers":
+        "Number of CPU cores used in parallel. 0 means 'auto' (uses about "
+        "half your cores so the rest of the machine stays responsive). Set "
+        "higher for batch runs on dedicated machines. Each worker uses memory "
+        "for one rendered page at a time.",
+    "use_text_layer":
+        "Many PDFs (anything exported from Word, Excel, etc.) already contain "
+        "real, perfectly accurate text. With this on, the tool detects those "
+        "pages and uses the embedded text directly instead of OCR'ing the "
+        "image — much faster and 100% accurate. Scanned/image-only PDFs are "
+        "OCR'd as before.",
+    "best_accuracy":
+        "Runs OCR multiple times per page with different segmentation "
+        "settings and keeps the result with the highest average confidence. "
+        "Roughly doubles processing time. Worthwhile for pages where the "
+        "default mis-reads a few words.",
+
+    # ---- Watch folder ----
+    "watch_folder":
+        "Pick a folder. The tool polls it for new PDFs and processes them "
+        "automatically using the current settings. Use this for drop-folder "
+        "workflows where files appear over time.",
+    "watch_interval":
+        "How often (in seconds) the tool checks the watch folder for new "
+        "PDFs. 5 seconds is a good default.",
 }
 
 
@@ -835,12 +1173,23 @@ class OcrApp(tk.Tk):
         self._worker: Optional[threading.Thread] = None
         self._log_queue: "queue.Queue[tuple]" = queue.Queue()
 
+        # Validation / report state populated after each run.
+        self._last_metrics: List[Dict[str, Any]] = []
+        self._last_run_settings: Optional[OcrSettings] = None
+        self._last_run_elapsed: float = 0.0
+
+        # Watch-folder state.
+        self._watch_thread: Optional[threading.Thread] = None
+        self._watch_stop = threading.Event()
+        self._watch_seen: set = set()
+
         self._build_menu()
         self._build_widgets()
         self._load_config()
         self._auto_detect_tesseract()
         self.after(100, self._drain_log_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._maybe_show_welcome)
 
     # ---- top menu ----
     def _build_menu(self) -> None:
@@ -848,6 +1197,10 @@ class OcrApp(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Add files...", command=self._add_files)
         file_menu.add_command(label="Add folder...", command=self._add_folder)
+        self._recent_files_menu = tk.Menu(file_menu, tearoff=False)
+        self._recent_folders_menu = tk.Menu(file_menu, tearoff=False)
+        file_menu.add_cascade(label="Recent files", menu=self._recent_files_menu)
+        file_menu.add_cascade(label="Recent folders", menu=self._recent_folders_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Save preset...", command=self._save_preset)
         file_menu.add_command(label="Load preset...", command=self._load_preset)
@@ -856,9 +1209,13 @@ class OcrApp(tk.Tk):
         menubar.add_cascade(label="File", menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="Quick start guide...", command=self._show_welcome)
         help_menu.add_command(label="Settings reference...", command=self._show_settings_reference)
-        help_menu.add_command(label="Tesseract status...", command=self._show_tesseract_status)
         help_menu.add_separator()
+        help_menu.add_command(label="Run self-test...", command=self._run_self_test)
+        help_menu.add_command(label="Last validation report...", command=self._show_last_report)
+        help_menu.add_separator()
+        help_menu.add_command(label="Tesseract status...", command=self._show_tesseract_status)
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -883,17 +1240,23 @@ class OcrApp(tk.Tk):
         self._tab_prep = ttk.Frame(notebook, padding=10)
         self._tab_layout = ttk.Frame(notebook, padding=10)
         self._tab_diag = ttk.Frame(notebook, padding=10)
+        self._tab_validation = ttk.Frame(notebook, padding=10)
+        self._tab_watch = ttk.Frame(notebook, padding=10)
         notebook.add(self._tab_files, text="Files & Output")
         notebook.add(self._tab_ocr, text="OCR")
         notebook.add(self._tab_prep, text="Preprocessing")
         notebook.add(self._tab_layout, text="Layout & Noise")
         notebook.add(self._tab_diag, text="Diagnostics")
+        notebook.add(self._tab_validation, text="Validation")
+        notebook.add(self._tab_watch, text="Watch folder")
 
         self._build_files_tab(self._tab_files)
         self._build_ocr_tab(self._tab_ocr)
         self._build_prep_tab(self._tab_prep)
         self._build_layout_tab(self._tab_layout)
         self._build_diag_tab(self._tab_diag)
+        self._build_validation_tab(self._tab_validation)
+        self._build_watch_tab(self._tab_watch)
 
         # bottom: progress + log + buttons
         bottom = ttk.Frame(outer)
@@ -1094,6 +1457,41 @@ class OcrApp(tk.Tk):
             row=7, column=2, sticky="w", pady=(6, 0))
         self._tip(ent_pages, "pages")
 
+        # ---- Performance / accuracy section ----
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        hdr = ttk.Label(parent, text="Performance & accuracy",
+                        font=("Segoe UI", 9, "bold"))
+        hdr.grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 2))
+
+        labelled(10, "Workers (CPU cores):", "workers")
+        cpu = os.cpu_count() or 1
+        self._workers_var = tk.IntVar(value=0)
+        sp_w = ttk.Spinbox(parent, from_=0, to=cpu, increment=1,
+                           textvariable=self._workers_var, width=8)
+        sp_w.grid(row=10, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text=f"0 = auto ({max(1, min(cpu // 2, 4))} on this PC, max {cpu})"
+                  ).grid(row=10, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp_w, "workers")
+
+        self._use_text_layer_var = tk.BooleanVar(value=True)
+        cb_tl = ttk.Checkbutton(
+            parent,
+            text="Use embedded PDF text when available (faster + perfectly accurate)",
+            variable=self._use_text_layer_var,
+        )
+        cb_tl.grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._tip(cb_tl, "use_text_layer")
+
+        self._best_accuracy_var = tk.BooleanVar(value=False)
+        cb_best = ttk.Checkbutton(
+            parent,
+            text="Best-accuracy mode — runs each page with multiple settings (~2x slower)",
+            variable=self._best_accuracy_var,
+        )
+        cb_best.grid(row=12, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self._tip(cb_best, "best_accuracy")
+
     # ---- "Preprocessing" tab ----
     def _build_prep_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -1177,6 +1575,29 @@ class OcrApp(tk.Tk):
             row=8, column=2, sticky="w", pady=(6, 0))
         self._tip(ent_crop, "crop")
 
+        # ---- Auto-cleanup ----
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        ttk.Label(parent, text="Auto-cleanup",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=10, column=0, columnspan=3, sticky="w", pady=(0, 2))
+
+        self._deskew_var = tk.BooleanVar(value=False)
+        cb_des = ttk.Checkbutton(
+            parent, text="Auto-deskew (straighten tilted scans)",
+            variable=self._deskew_var,
+        )
+        cb_des.grid(row=11, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self._tip(cb_des, "deskew")
+
+        self._denoise_var = tk.BooleanVar(value=False)
+        cb_dn = ttk.Checkbutton(
+            parent, text="Denoise (clean speckle and grain from scans)",
+            variable=self._denoise_var,
+        )
+        cb_dn.grid(row=12, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self._tip(cb_dn, "denoise")
+
     # ---- "Layout & Noise" tab ----
     def _build_layout_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -1246,6 +1667,109 @@ class OcrApp(tk.Tk):
         cb_cc.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self._tip(cb_cc, "conf_comments")
 
+        self._audit_var = tk.BooleanVar(value=True)
+        cb_audit = ttk.Checkbutton(
+            parent,
+            text="Write per-run audit log (.json) next to outputs",
+            variable=self._audit_var,
+        )
+        cb_audit.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._tip(cb_audit, "audit_log")
+
+    # ---- "Validation" tab ----
+    def _build_validation_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        intro = ttk.Label(
+            parent,
+            text=(
+                "After a run, this tab shows the rendered image of any page "
+                "with low-confidence OCR words highlighted in red. Use it to "
+                "spot-check the OCR before sharing the output."
+            ),
+            wraplength=900, justify="left",
+        )
+        intro.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        controls = ttk.Frame(parent)
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(controls, text="Page:").pack(side="left")
+        self._val_page_var = tk.StringVar(value="")
+        self._val_page_combo = ttk.Combobox(
+            controls, textvariable=self._val_page_var,
+            state="readonly", width=70,
+        )
+        self._val_page_combo.pack(side="left", padx=(4, 8), fill="x", expand=True)
+        self._val_page_combo.bind("<<ComboboxSelected>>", self._render_validation_preview)
+        ttk.Button(controls, text="Refresh", command=self._refresh_validation_list
+                   ).pack(side="left")
+        ttk.Button(controls, text="Show report", command=self._show_last_report
+                   ).pack(side="left", padx=(6, 0))
+
+        canvas_frame = ttk.Frame(parent, relief="sunken")
+        canvas_frame.grid(row=2, column=0, sticky="nsew")
+        canvas_frame.columnconfigure(0, weight=1)
+        canvas_frame.rowconfigure(0, weight=1)
+        self._val_canvas = tk.Canvas(canvas_frame, background="#222", highlightthickness=0)
+        self._val_canvas.grid(row=0, column=0, sticky="nsew")
+        vbar = ttk.Scrollbar(canvas_frame, orient="vertical",
+                             command=self._val_canvas.yview)
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar = ttk.Scrollbar(canvas_frame, orient="horizontal",
+                             command=self._val_canvas.xview)
+        hbar.grid(row=1, column=0, sticky="ew")
+        self._val_canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self._val_preview_image = None  # keep a reference so Tk doesn't gc it
+
+    # ---- "Watch folder" tab ----
+    def _build_watch_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            parent,
+            text=(
+                "Pick a folder and click Start watching. New PDFs added to "
+                "the folder are processed automatically using the current "
+                "settings, and their outputs are written to the output "
+                "folder on the Files & Output tab."
+            ),
+            wraplength=900, justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+
+        lbl = ttk.Label(parent, text="Folder to watch:")
+        lbl.grid(row=1, column=0, sticky="w")
+        self._watch_folder_var = tk.StringVar()
+        ent = ttk.Entry(parent, textvariable=self._watch_folder_var)
+        ent.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Button(parent, text="Browse...", command=self._pick_watch_folder
+                   ).grid(row=1, column=2)
+        self._tip(lbl, "watch_folder"); self._tip(ent, "watch_folder")
+
+        lbl2 = ttk.Label(parent, text="Poll every (seconds):")
+        lbl2.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self._watch_interval_var = tk.IntVar(value=5)
+        sp = ttk.Spinbox(parent, from_=2, to=300, increment=1,
+                         textvariable=self._watch_interval_var, width=8)
+        sp.grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
+        self._tip(lbl2, "watch_interval"); self._tip(sp, "watch_interval")
+
+        self._watch_status_var = tk.StringVar(value="Not watching.")
+        ttk.Label(parent, textvariable=self._watch_status_var,
+                  foreground="#444").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._watch_start_btn = ttk.Button(
+            btn_row, text="Start watching", command=self._start_watch,
+        )
+        self._watch_start_btn.pack(side="left")
+        self._watch_stop_btn = ttk.Button(
+            btn_row, text="Stop watching", command=self._stop_watch, state="disabled",
+        )
+        self._watch_stop_btn.pack(side="left", padx=(6, 0))
+
     # ---- file/folder pickers ----
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -1255,12 +1779,14 @@ class OcrApp(tk.Tk):
         for p in paths:
             if p not in self._files_list.get(0, "end"):
                 self._files_list.insert("end", p)
+            self._push_recent_file(p)
         self._maybe_default_output_dir()
 
     def _add_folder(self) -> None:
         folder = filedialog.askdirectory(title="Select folder of PDFs")
         if not folder:
             return
+        self._push_recent_folder(folder)
         added = 0
         for root, _, files in os.walk(folder):
             for f in files:
@@ -1468,6 +1994,9 @@ class OcrApp(tk.Tk):
                 ("Render scale",         "render_scale"),
                 ("Min word confidence",  "min_conf"),
                 ("Pages",                "pages"),
+                ("Workers (CPU cores)",  "workers"),
+                ("Use embedded PDF text","use_text_layer"),
+                ("Best-accuracy mode",   "best_accuracy"),
             ]),
             ("Preprocessing", [
                 ("Keep RGB",             "no_grayscale"),
@@ -1479,6 +2008,8 @@ class OcrApp(tk.Tk):
                 ("Dilate kernel",        "dilate"),
                 ("Erode kernel",         "erode"),
                 ("Crop",                 "crop"),
+                ("Auto-deskew",          "deskew"),
+                ("Denoise",              "denoise"),
             ]),
             ("Layout & Noise", [
                 ("Row tolerance",        "row_tol"),
@@ -1490,6 +2021,11 @@ class OcrApp(tk.Tk):
                 ("Debug folder",         "debug_dir"),
                 ("Save raw text",        "save_raw"),
                 ("Confidence comments",  "conf_comments"),
+                ("Audit log",            "audit_log"),
+            ]),
+            ("Watch folder", [
+                ("Folder to watch",      "watch_folder"),
+                ("Poll interval",        "watch_interval"),
             ]),
         ]
 
@@ -1502,6 +2038,437 @@ class OcrApp(tk.Tk):
         txt.configure(state="disabled")
 
         ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(6, 0))
+
+    # ---- Welcome / first-launch tour ----
+    def _maybe_show_welcome(self) -> None:
+        if not getattr(self, "_seen_welcome", False):
+            self._show_welcome()
+
+    def _show_welcome(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Quick start — PDF OCR Tool")
+        win.geometry("680x560")
+        win.transient(self)
+        outer = ttk.Frame(win, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer, text=f"Welcome to {APP_TITLE}",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+
+        steps: List[Tuple[str, str]] = [
+            ("1. Add your PDFs",
+             "On the Files & Output tab, click 'Add files…' or 'Add folder…' "
+             "to put PDFs in the queue, then pick an output folder."),
+            ("2. Pick output formats",
+             "Tick one or more boxes — Markdown, plain text, JSON, CSV, "
+             "HTML, or searchable PDF. The tool produces all of them in a "
+             "single run."),
+            ("3. (Optional) Tune settings",
+             "Hover over any field in the OCR / Preprocessing / Layout tabs "
+             "for an explanation. Help → Settings reference lists them all in "
+             "one place. The defaults work for most reports."),
+            ("4. Click Start OCR",
+             "Watch the log at the bottom. The Workers spinbox on the OCR "
+             "tab lets you spend more CPU cores for faster results."),
+            ("5. Check the result",
+             "When it's done, the Validation tab highlights low-confidence "
+             "OCR words so you can spot-check accuracy. Help → Run self-test "
+             "verifies your install is working correctly."),
+        ]
+        for title, body in steps:
+            ttk.Label(outer, text=title, font=("Segoe UI", 10, "bold")
+                      ).pack(anchor="w", pady=(8, 0))
+            ttk.Label(outer, text=body, wraplength=620, justify="left"
+                      ).pack(anchor="w")
+
+        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=(12, 6))
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x")
+        self._dont_show_var = tk.BooleanVar(
+            value=getattr(self, "_seen_welcome", False),
+        )
+        ttk.Checkbutton(bar, text="Don't show this again",
+                        variable=self._dont_show_var).pack(side="left")
+
+        def _close() -> None:
+            self._seen_welcome = bool(self._dont_show_var.get())
+            self._save_config()
+            win.destroy()
+        ttk.Button(bar, text="Got it", command=_close).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+    # ---- Recent files menu ----
+    def _rebuild_recent_menus(self) -> None:
+        if not hasattr(self, "_recent_files_menu"):
+            return
+        self._recent_files_menu.delete(0, "end")
+        recent = getattr(self, "_recent_files_list", []) or []
+        if not recent:
+            self._recent_files_menu.add_command(label="(empty)", state="disabled")
+        else:
+            for p in recent:
+                self._recent_files_menu.add_command(
+                    label=self._abbr_path(p),
+                    command=lambda path=p: self._add_recent_to_queue(path),
+                )
+            self._recent_files_menu.add_separator()
+            self._recent_files_menu.add_command(
+                label="Clear list", command=self._clear_recent_files,
+            )
+
+        self._recent_folders_menu.delete(0, "end")
+        folders = getattr(self, "_recent_folders_list", []) or []
+        if not folders:
+            self._recent_folders_menu.add_command(label="(empty)", state="disabled")
+        else:
+            for f in folders:
+                self._recent_folders_menu.add_command(
+                    label=self._abbr_path(f),
+                    command=lambda folder=f: self._add_recent_folder_to_queue(folder),
+                )
+            self._recent_folders_menu.add_separator()
+            self._recent_folders_menu.add_command(
+                label="Clear list", command=self._clear_recent_folders,
+            )
+
+    @staticmethod
+    def _abbr_path(p: str, limit: int = 60) -> str:
+        if len(p) <= limit:
+            return p
+        return "..." + p[-(limit - 3):]
+
+    def _push_recent_file(self, path: str) -> None:
+        if not hasattr(self, "_recent_files_list"):
+            self._recent_files_list = []
+        lst = self._recent_files_list
+        if path in lst:
+            lst.remove(path)
+        lst.insert(0, path)
+        del lst[10:]
+        self._rebuild_recent_menus()
+
+    def _push_recent_folder(self, path: str) -> None:
+        if not hasattr(self, "_recent_folders_list"):
+            self._recent_folders_list = []
+        lst = self._recent_folders_list
+        if path in lst:
+            lst.remove(path)
+        lst.insert(0, path)
+        del lst[5:]
+        self._rebuild_recent_menus()
+
+    def _clear_recent_files(self) -> None:
+        self._recent_files_list = []
+        self._rebuild_recent_menus()
+
+    def _clear_recent_folders(self) -> None:
+        self._recent_folders_list = []
+        self._rebuild_recent_menus()
+
+    def _add_recent_to_queue(self, path: str) -> None:
+        if Path(path).exists():
+            if path not in self._files_list.get(0, "end"):
+                self._files_list.insert("end", path)
+            self._maybe_default_output_dir()
+            self._push_recent_file(path)
+        else:
+            messagebox.showwarning("Missing", f"File no longer exists:\n{path}")
+
+    def _add_recent_folder_to_queue(self, folder: str) -> None:
+        if not Path(folder).is_dir():
+            messagebox.showwarning("Missing", f"Folder no longer exists:\n{folder}")
+            return
+        added = 0
+        for root, _, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(".pdf"):
+                    full = str(Path(root) / f)
+                    if full not in self._files_list.get(0, "end"):
+                        self._files_list.insert("end", full)
+                        added += 1
+        self._log(f"Added {added} PDF(s) from {folder}")
+        self._push_recent_folder(folder)
+        self._maybe_default_output_dir()
+
+    # ---- Validation tab ----
+    def _refresh_validation_list(self) -> None:
+        entries: List[Tuple[str, Dict[str, Any]]] = []
+        for metrics in getattr(self, "_last_metrics", []) or []:
+            pdf_name = Path(metrics.get("pdf", "")).name
+            for res in metrics.get("_page_results", []) or []:
+                if res.is_error:
+                    label = (f"{pdf_name}  ·  page {res.page_index + 1}  ·  "
+                             f"ERROR ({res.error})")
+                elif res.used_text_layer:
+                    label = (f"{pdf_name}  ·  page {res.page_index + 1}  ·  "
+                             "text-layer (no OCR)")
+                else:
+                    label = (f"{pdf_name}  ·  page {res.page_index + 1}  ·  "
+                             f"avg conf {res.avg_conf:.1f}, "
+                             f"{res.word_count} words")
+                entries.append((label, {"pdf": metrics.get("pdf"),
+                                         "result": res}))
+        self._val_entries = entries
+        labels = [e[0] for e in entries]
+        self._val_page_combo["values"] = labels
+        if labels:
+            self._val_page_combo.current(0)
+            self._render_validation_preview()
+        else:
+            self._val_canvas.delete("all")
+            self._val_canvas.create_text(
+                20, 20, anchor="nw", fill="#aaa",
+                text="No run yet. Click Start OCR on the Files & Output tab.",
+            )
+
+    def _render_validation_preview(self, _event: Any = None) -> None:
+        try:
+            idx = self._val_page_combo.current()
+        except Exception:
+            idx = -1
+        if idx < 0 or idx >= len(getattr(self, "_val_entries", [])):
+            return
+        entry = self._val_entries[idx][1]
+        pdf_path = entry["pdf"]
+        res = entry["result"]
+        if not pdf_path or not Path(pdf_path).exists():
+            return
+
+        # Re-render the page at a reasonable preview scale so the displayed
+        # canvas image stays manageable. Scale down OCR-time coordinates to
+        # match the preview's render scale.
+        try:
+            doc = fitz.open(pdf_path)
+            try:
+                page = doc[res.page_index]
+                preview_scale = 2.0
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(preview_scale, preview_scale),
+                    alpha=False,
+                )
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
+        except Exception as exc:
+            messagebox.showerror("Preview failed", str(exc))
+            return
+
+        try:
+            from PIL import ImageDraw, ImageTk
+        except Exception:
+            messagebox.showerror("Preview failed",
+                                 "Pillow ImageTk unavailable in this build.")
+            return
+
+        draw = ImageDraw.Draw(img)
+        if not res.used_text_layer and res.words and res.rendered_size != (0, 0):
+            scale_factor = preview_scale / max(0.001, self._last_run_settings.render_scale
+                                                if self._last_run_settings else 1.0)
+            for w in res.words:
+                if w.conf < 70:
+                    x1 = int(w.x * scale_factor)
+                    y1 = int(w.y * scale_factor)
+                    x2 = int((w.x + w.w) * scale_factor)
+                    y2 = int((w.y + w.h) * scale_factor)
+                    draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+
+        self._val_preview_image = ImageTk.PhotoImage(img)
+        self._val_canvas.delete("all")
+        self._val_canvas.create_image(
+            0, 0, anchor="nw", image=self._val_preview_image,
+        )
+        self._val_canvas.configure(scrollregion=(0, 0, img.width, img.height))
+
+    # ---- Last validation report ----
+    def _show_last_report(self) -> None:
+        if not self._last_metrics:
+            messagebox.showinfo(
+                "Validation report",
+                "No run yet. Click Start OCR on the Files & Output tab.",
+            )
+            return
+        win = tk.Toplevel(self)
+        win.title("Last validation report")
+        win.geometry("780x560")
+        win.transient(self)
+        outer = ttk.Frame(win, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer,
+            text=f"Total wall-clock time: {self._last_run_elapsed:.1f} s",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+
+        cols = ("file", "pages", "ocr", "text-layer", "avg conf", "low conf", "words", "elapsed")
+        tree = ttk.Treeview(outer, columns=cols, show="headings", height=12)
+        for c, w in zip(cols, (260, 60, 60, 80, 80, 80, 80, 70)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w")
+        tree.pack(fill="both", expand=True, pady=(8, 6))
+
+        for m in self._last_metrics:
+            tree.insert("", "end", values=(
+                Path(m.get("pdf", "")).name,
+                m.get("pages_processed", 0),
+                m.get("pages_via_ocr", 0),
+                m.get("pages_via_text_layer", 0),
+                f"{m.get('avg_confidence', 0):.1f}",
+                len(m.get("low_confidence_pages", [])),
+                m.get("total_words", 0),
+                f"{m.get('elapsed_sec', 0):.1f}s",
+            ))
+
+        ttk.Label(outer, text="Low-confidence pages (avg conf < 70):"
+                  ).pack(anchor="w", pady=(8, 2))
+        lo = tk.Text(outer, height=6, wrap="word")
+        lo.pack(fill="both", expand=False)
+        any_low = False
+        for m in self._last_metrics:
+            for page, conf in m.get("low_confidence_pages", []):
+                lo.insert("end",
+                          f"  {Path(m.get('pdf','')).name} · page {page} · "
+                          f"avg conf {conf}\n")
+                any_low = True
+        if not any_low:
+            lo.insert("end", "  (none — all pages above 70 average confidence)\n")
+        lo.configure(state="disabled")
+
+        ttk.Button(outer, text="Close", command=win.destroy
+                   ).pack(anchor="e", pady=(6, 0))
+
+    # ---- Self-test ----
+    def _run_self_test(self) -> None:
+        from tkinter import scrolledtext
+        ok, msg = tesseract_works(self._tess_var.get().strip() or None)
+        if not ok:
+            messagebox.showerror(
+                "Self-test failed",
+                "Tesseract is not available. Configure it on the OCR tab "
+                f"first.\n\n{msg}",
+            )
+            return
+
+        path = self._tess_var.get().strip() or None
+        if path:
+            pytesseract.pytesseract.tesseract_cmd = path
+
+        progress = tk.Toplevel(self)
+        progress.title("Running self-test")
+        progress.geometry("420x140")
+        progress.transient(self)
+        ttk.Label(progress,
+                  text="Generating a known PDF and OCR'ing it…",
+                  padding=10).pack()
+        bar = ttk.Progressbar(progress, mode="indeterminate", length=320)
+        bar.pack(pady=8)
+        bar.start(8)
+        self.update_idletasks()
+
+        def work() -> None:
+            try:
+                report = _self_test_run(self._lang_var.get().strip() or "eng")
+                self.after(0, lambda: self._show_self_test_result(report, progress))
+            except Exception as exc:
+                self.after(0, lambda: self._show_self_test_result(
+                    {"ok": False, "error": str(exc)}, progress))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_self_test_result(self, report: Dict[str, Any], progress: tk.Toplevel) -> None:
+        try:
+            progress.destroy()
+        except Exception:
+            pass
+        if not report.get("ok"):
+            messagebox.showerror(
+                "Self-test failed",
+                report.get("error", "Unknown error."),
+            )
+            return
+        accuracy = report["accuracy"] * 100.0
+        body = (
+            f"Self-test {accuracy:.1f}% accurate.\n\n"
+            f"  Tesseract version : {report['tess_version']}\n"
+            f"  Words expected    : {report['expected_words']}\n"
+            f"  Words matched     : {report['matched_words']}\n"
+            f"  Pages tested      : {report['pages']}\n"
+            f"  Elapsed           : {report['elapsed']:.2f}s"
+        )
+        if accuracy >= 90:
+            messagebox.showinfo("Self-test passed", body)
+        else:
+            messagebox.showwarning(
+                "Self-test below 90%",
+                body + "\n\nTesseract is reading the test PDF but accuracy "
+                       "is low. Check the OCR settings (PSM, render scale).",
+            )
+
+    # ---- Watch folder ----
+    def _pick_watch_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Pick folder to watch")
+        if folder:
+            self._watch_folder_var.set(folder)
+
+    def _start_watch(self) -> None:
+        folder = self._watch_folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Watch folder", "Pick a valid folder first.")
+            return
+        if not self._out_dir_var.get().strip():
+            messagebox.showerror(
+                "Watch folder",
+                "Set an output folder on the Files & Output tab first.",
+            )
+            return
+        self._watch_stop.clear()
+        # seed with current contents so we don't re-process backlog
+        self._watch_seen = {
+            str(p) for p in Path(folder).glob("*.pdf") if p.is_file()
+        }
+        interval = max(2, int(self._watch_interval_var.get()))
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop, args=(folder, interval), daemon=True,
+        )
+        self._watch_thread.start()
+        self._watch_start_btn.configure(state="disabled")
+        self._watch_stop_btn.configure(state="normal")
+        self._watch_status_var.set(
+            f"Watching {folder} every {interval}s "
+            f"(currently ignoring {len(self._watch_seen)} pre-existing file(s))"
+        )
+        self._log(f"Started watching folder: {folder}")
+
+    def _stop_watch(self) -> None:
+        self._watch_stop.set()
+        self._watch_start_btn.configure(state="normal")
+        self._watch_stop_btn.configure(state="disabled")
+        self._watch_status_var.set("Not watching.")
+        self._log("Stopped folder watcher.")
+
+    def _watch_loop(self, folder: str, interval: int) -> None:
+        while not self._watch_stop.is_set():
+            try:
+                current = {str(p) for p in Path(folder).glob("*.pdf") if p.is_file()}
+                new = sorted(current - self._watch_seen)
+                if new:
+                    self._watch_seen |= set(new)
+                    self._log(f"[watch] {len(new)} new PDF(s) — queuing")
+                    self.after(0, lambda items=new: self._queue_and_run_watched(items))
+            except Exception as exc:
+                self._log(f"[watch] error: {exc}")
+            self._watch_stop.wait(interval)
+
+    def _queue_and_run_watched(self, paths: List[str]) -> None:
+        if self._worker and self._worker.is_alive():
+            self._log("[watch] OCR busy; deferring new files until the current run finishes")
+            return
+        for p in paths:
+            if p not in self._files_list.get(0, "end"):
+                self._files_list.insert("end", p)
+        self._on_start()
 
     # ---- settings I/O ----
     def _collect_settings(self) -> OcrSettings:
@@ -1542,6 +2509,18 @@ class OcrApp(tk.Tk):
 
             open_when_done=bool(self._open_when_done_var.get()),
             show_notification=bool(self._show_notify_var.get()),
+
+            workers=int(self._workers_var.get()),
+            use_text_layer=bool(self._use_text_layer_var.get()),
+            deskew=bool(self._deskew_var.get()),
+            denoise=bool(self._denoise_var.get()),
+            best_accuracy=bool(self._best_accuracy_var.get()),
+            write_audit_log=bool(self._audit_var.get()),
+            seen_welcome=getattr(self, "_seen_welcome", False),
+            recent_files=list(getattr(self, "_recent_files_list", [])),
+            recent_folders=list(getattr(self, "_recent_folders_list", [])),
+            watch_folder=self._watch_folder_var.get().strip(),
+            watch_interval_sec=int(self._watch_interval_var.get()),
         )
 
     def _apply_settings(self, s: OcrSettings, only_processing: bool = False) -> None:
@@ -1558,6 +2537,12 @@ class OcrApp(tk.Tk):
             self._debug_dir_var.set(s.debug_dir)
             self._open_when_done_var.set(s.open_when_done)
             self._show_notify_var.set(s.show_notification)
+            self._seen_welcome = s.seen_welcome
+            self._recent_files_list = list(s.recent_files)
+            self._recent_folders_list = list(s.recent_folders)
+            self._rebuild_recent_menus()
+            self._watch_folder_var.set(s.watch_folder)
+            self._watch_interval_var.set(max(2, int(s.watch_interval_sec or 5)))
 
         self._lang_var.set(s.lang)
         self._psm_var.set(s.psm)
@@ -1583,9 +2568,20 @@ class OcrApp(tk.Tk):
 
         self._save_raw_var.set(s.save_raw)
         self._conf_comments_var.set(s.confidence_comments)
+        self._audit_var.set(s.write_audit_log)
+
+        self._workers_var.set(s.workers)
+        self._use_text_layer_var.set(s.use_text_layer)
+        self._deskew_var.set(s.deskew)
+        self._denoise_var.set(s.denoise)
+        self._best_accuracy_var.set(s.best_accuracy)
 
     def _load_config(self) -> None:
         if not CONFIG_FILE.exists():
+            self._seen_welcome = False
+            self._recent_files_list = []
+            self._recent_folders_list = []
+            self._rebuild_recent_menus()
             return
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -1680,6 +2676,10 @@ class OcrApp(tk.Tk):
         self._set_progress(0, 1)
         if ok:
             self._set_status("Done.")
+            try:
+                self._refresh_validation_list()
+            except Exception:
+                pass
             if self._show_notify_var.get():
                 messagebox.showinfo("OCR complete", summary)
             if self._open_when_done_var.get():
@@ -1711,13 +2711,45 @@ class OcrApp(tk.Tk):
 
     # ---- worker thread ----
     def _worker_main(self, settings: OcrSettings) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+
+        executor: Optional[ThreadPoolExecutor] = None
+        per_file_metrics: List[Dict[str, Any]] = []
+        # Tesseract uses OpenMP internally. With many threads each spawning a
+        # Tesseract subprocess, every subprocess tries to grab all cores and
+        # they thrash. Cap each Tesseract subprocess to a single OpenMP
+        # thread so our page-level parallelism is the only level that scales.
+        os.environ.setdefault("OMP_THREAD_LIMIT", "1")
         try:
             Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
             if settings.debug_dir:
                 Path(settings.debug_dir).mkdir(parents=True, exist_ok=True)
 
+            workers = self._effective_workers(settings)
+            if workers > 1:
+                try:
+                    # Threads: PyMuPDF render, OpenCV preprocessing, and the
+                    # Tesseract subprocess all release the GIL, so threads
+                    # give real parallelism without the cold-start cost of
+                    # spawning child Python interpreters in a frozen .exe.
+                    executor = ThreadPoolExecutor(
+                        max_workers=workers,
+                        thread_name_prefix="ocr",
+                    )
+                    self._log(f"Using {workers} parallel worker thread(s).")
+                except Exception as exc:
+                    self._log(
+                        f"Could not start worker pool ({exc}); "
+                        "falling back to single-worker mode."
+                    )
+                    executor = None
+            else:
+                self._log("Running single-worker mode.")
+
             per_file_results: List[Tuple[Path, Dict[str, Any]]] = []
             n_files = len(settings.inputs)
+            run_started = time.perf_counter()
 
             for file_idx, pdf in enumerate(settings.inputs):
                 if self._cancel_event.is_set():
@@ -1726,18 +2758,30 @@ class OcrApp(tk.Tk):
                 self._log(f"[{file_idx + 1}/{n_files}] {pdf_path.name}")
                 self._set_status(f"{pdf_path.name} ({file_idx + 1}/{n_files})")
 
-                results = process_pdf_multi(
-                    pdf_path, settings,
+                # Encrypted PDF? Prompt for password on the GUI thread.
+                pdf_password = self._prompt_password_if_needed(pdf_path)
+                if pdf_password is None:
+                    self._log("    [skipped] password not provided")
+                    continue
+
+                outputs, metrics = process_pdf_multi(
+                    pdf_path, pdf_password, settings,
                     log=self._log,
                     progress=self._set_progress,
                     cancel_event=self._cancel_event,
+                    executor=executor,
                 )
-                per_file_results.append((pdf_path, results))
+                per_file_results.append((pdf_path, outputs))
+                per_file_metrics.append(metrics)
 
                 if settings.output_mode == "per_file":
                     self._write_outputs(
-                        pdf_path.stem, results, settings.output_dir
+                        pdf_path.stem, outputs, settings.output_dir
                     )
+                    if settings.write_audit_log:
+                        self._write_audit_log(
+                            pdf_path.stem, metrics, settings,
+                        )
 
             if settings.output_mode == "combined":
                 self._write_combined(
@@ -1746,10 +2790,23 @@ class OcrApp(tk.Tk):
                     settings.output_dir,
                     settings.output_formats,
                 )
+                if settings.write_audit_log:
+                    self._write_audit_log(
+                        settings.combined_basename,
+                        {"per_file": [
+                            {k: v for k, v in m.items() if k != "_page_results"}
+                            for m in per_file_metrics
+                        ]},
+                        settings,
+                    )
 
+            self._last_metrics = per_file_metrics
+            self._last_run_settings = settings
+            self._last_run_elapsed = time.perf_counter() - run_started
             self._log_queue.put((
                 "done", True,
-                f"Processed {n_files} file(s).\nOutput folder:\n{settings.output_dir}",
+                self._summarize_run(per_file_metrics, n_files,
+                                     settings.output_dir),
             ))
         except CancelledError:
             self._log("Cancelled.")
@@ -1758,6 +2815,131 @@ class OcrApp(tk.Tk):
             self._log("ERROR: " + str(exc))
             self._log(traceback.format_exc())
             self._log_queue.put(("done", False, f"{type(exc).__name__}: {exc}"))
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+    def _effective_workers(self, settings: OcrSettings) -> int:
+        cpu = os.cpu_count() or 1
+        if settings.workers and settings.workers > 0:
+            return max(1, min(settings.workers, cpu))
+        # auto: half the cores, capped at 4 to leave headroom for the OS
+        return max(1, min(cpu // 2, 4))
+
+    def _summarize_run(
+        self, metrics: List[Dict[str, Any]], n_files: int, out_dir: str,
+    ) -> str:
+        if not metrics:
+            return f"No files processed.\nOutput folder:\n{out_dir}"
+        total_pages = sum(m.get("pages_processed", 0) for m in metrics)
+        total_words = sum(m.get("total_words", 0) for m in metrics)
+        ocr_pages = sum(m.get("pages_via_ocr", 0) for m in metrics)
+        text_layer = sum(m.get("pages_via_text_layer", 0) for m in metrics)
+        avg_conf_vals = [m.get("avg_confidence", 0.0) for m in metrics if m.get("pages_via_ocr")]
+        avg_conf = sum(avg_conf_vals) / len(avg_conf_vals) if avg_conf_vals else 0.0
+        low = sum(len(m.get("low_confidence_pages", [])) for m in metrics)
+        errs = sum(m.get("pages_errored", 0) for m in metrics)
+        lines = [
+            f"Processed {n_files} file(s), {total_pages} page(s), {total_words:,} words.",
+            f"OCR pages: {ocr_pages}   Text-layer pages: {text_layer}",
+            f"Average OCR confidence: {avg_conf:.1f} / 100",
+            f"Low-confidence pages (<70): {low}",
+        ]
+        if errs:
+            lines.append(f"Errors: {errs}")
+        lines.append("")
+        lines.append(f"Output folder:\n{out_dir}")
+        lines.append("\nOpen Help → Last validation report for the per-file breakdown.")
+        return "\n".join(lines)
+
+    def _write_audit_log(
+        self, basename: str, metrics: Dict[str, Any], settings: OcrSettings,
+    ) -> None:
+        try:
+            import hashlib, datetime
+            tess_path = settings.tesseract_path or pytesseract.pytesseract.tesseract_cmd
+            tess_version = ""
+            try:
+                proc = subprocess.run([tess_path, "--version"],
+                                      capture_output=True, text=True, timeout=10)
+                tess_version = (proc.stdout or proc.stderr).splitlines()[0:1]
+                tess_version = tess_version[0] if tess_version else ""
+            except Exception:
+                pass
+
+            # Strip transient fields and live PageResult objects
+            sanitized: Dict[str, Any] = {}
+            for k, v in metrics.items():
+                if k == "_page_results":
+                    continue
+                sanitized[k] = v
+            if "per_file" in sanitized:
+                for entry in sanitized["per_file"]:
+                    entry.pop("_page_results", None)
+
+            audit = {
+                "tool": f"{APP_TITLE} v{APP_VERSION}",
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "tesseract": tess_version,
+                "settings": asdict(settings),
+                "metrics": sanitized,
+            }
+            # SHA-256 of the source PDF when we have one path
+            pdf_path_str = metrics.get("pdf")
+            if isinstance(pdf_path_str, str) and Path(pdf_path_str).exists():
+                with open(pdf_path_str, "rb") as f:
+                    audit["source_sha256"] = hashlib.sha256(f.read()).hexdigest()
+
+            target = Path(settings.output_dir) / f"{basename}_audit.json"
+            target.write_text(json.dumps(audit, indent=2, ensure_ascii=False),
+                              encoding="utf-8")
+            self._log(f"  wrote {target.name}")
+        except Exception as exc:
+            self._log(f"  [warn] could not write audit log: {exc}")
+
+    def _prompt_password_if_needed(self, pdf_path: Path) -> Optional[str]:
+        """Return the password to use for ``pdf_path`` (may be ''), or None
+        if the user cancelled the prompt for an encrypted file."""
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            return ""
+        try:
+            if not doc.needs_pass:
+                return ""
+        finally:
+            doc.close()
+
+        if not hasattr(self, "_password_cache"):
+            self._password_cache: Dict[str, str] = {}
+        key = str(pdf_path.resolve())
+        if key in self._password_cache:
+            return self._password_cache[key]
+
+        # GUI prompt must run on the Tk thread.
+        result_holder: List[Optional[str]] = [None]
+        event = threading.Event()
+
+        def ask() -> None:
+            try:
+                from tkinter import simpledialog
+                pwd = simpledialog.askstring(
+                    "Password required",
+                    f"{pdf_path.name} is encrypted.\nEnter the password:",
+                    show="*",
+                    parent=self,
+                )
+                result_holder[0] = pwd
+            finally:
+                event.set()
+
+        self.after(0, ask)
+        event.wait()
+        pwd = result_holder[0]
+        if pwd is None:
+            return None
+        self._password_cache[key] = pwd
+        return pwd
 
     # ---- file writers ----
     def _write_outputs(
@@ -1868,7 +3050,96 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+# ---------------------------------------------------------------------------
+# Self-test — generate a known PDF and OCR it
+# ---------------------------------------------------------------------------
+_SELF_TEST_SENTENCES = [
+    "The quick brown fox jumps over the lazy dog.",
+    "Pack my box with five dozen liquor jugs.",
+    "How vexingly quick daft zebras jump!",
+    "Sphinx of black quartz, judge my vow.",
+    "The five boxing wizards jump quickly.",
+    "Amazingly few discotheques provide jukeboxes.",
+    "Bright vixens jump; dozy fowl quack.",
+    "Crazy Fredrick bought many very exquisite opal jewels.",
+]
+
+
+def _self_test_run(lang: str) -> Dict[str, Any]:
+    """Generate a small PDF with known text, OCR it, return accuracy metrics."""
+    import time
+    t0 = time.perf_counter()
+
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=612, height=792)  # US letter, 72 dpi
+        y = 72
+        for line in _SELF_TEST_SENTENCES:
+            page.insert_text((72, y), line, fontname="helv", fontsize=18)
+            y += 36
+        pdf_bytes = doc.tobytes()
+    finally:
+        doc.close()
+
+    # OCR the rendered page
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0), alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    finally:
+        doc.close()
+
+    config = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
+    ocr_text = pytesseract.image_to_string(img, lang=lang, config=config)
+    elapsed = time.perf_counter() - t0
+
+    # Word-level accuracy: count expected words that appear at least the
+    # right number of times in the OCR output (case-insensitive).
+    import re as _re
+    expected = []
+    for s in _SELF_TEST_SENTENCES:
+        expected.extend(_re.findall(r"[A-Za-z']+", s))
+    got = [w.lower() for w in _re.findall(r"[A-Za-z']+", ocr_text)]
+    got_lower = list(got)
+    matched = 0
+    for w in expected:
+        wl = w.lower()
+        if wl in got_lower:
+            matched += 1
+            got_lower.remove(wl)
+    accuracy = matched / max(1, len(expected))
+
+    tess_version = ""
+    try:
+        proc = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        first = (proc.stdout or proc.stderr).splitlines()[0:1]
+        tess_version = first[0] if first else ""
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "accuracy": accuracy,
+        "expected_words": len(expected),
+        "matched_words": matched,
+        "pages": 1,
+        "elapsed": elapsed,
+        "tess_version": tess_version,
+        "ocr_text": ocr_text,
+    }
+
+
 def main() -> int:
+    # Required for PyInstaller-frozen .exe so child processes spawned by
+    # ProcessPoolExecutor do not re-launch the GUI. Safe to call on all
+    # platforms; no-op when not frozen.
+    import multiprocessing as _mp
+    _mp.freeze_support()
+
     app = OcrApp()
     app.mainloop()
     return 0
