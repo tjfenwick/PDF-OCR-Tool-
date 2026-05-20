@@ -595,6 +595,232 @@ def _merge_pdf_pages(pdf_page_bytes: List[bytes]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Tooltips
+# ---------------------------------------------------------------------------
+class Tooltip:
+    """Hover-to-show tooltip for any Tkinter widget."""
+
+    def __init__(self, widget, text: str,
+                 delay_ms: int = 450, wraplength: int = 380) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self._tip: Optional[tk.Toplevel] = None
+        self._after_id: Optional[str] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        except Exception:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            tip,
+            text=self.text,
+            justify="left",
+            background="#FFFFE0",
+            foreground="#222",
+            relief="solid",
+            borderwidth=1,
+            wraplength=self.wraplength,
+            padx=8, pady=5,
+            font=("Segoe UI", 9),
+        ).pack()
+        self._tip = tip
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+TOOLTIPS: Dict[str, str] = {
+    # ---- Files & Output ----
+    "files_list":
+        "Queue of PDFs to process. Use Add files... to pick individual PDFs, "
+        "Add folder... to pull every PDF below a folder (recursive), and "
+        "Move up/down to control the ordering used in combined-output files.",
+    "add_files":         "Pick one or more PDF files to add to the queue.",
+    "add_folder":        "Add every .pdf below a chosen folder (recursive).",
+    "remove":            "Remove the selected items from the queue.",
+    "clear":             "Remove all items from the queue.",
+    "move_up":           "Move the selected items up the list.",
+    "move_down":         "Move the selected items down the list.",
+    "output_dir":
+        "Folder where output files will be written. If left empty when you "
+        "add files, it defaults to the folder of the first input PDF.",
+    "output_mode":
+        "Per-file: one output (or set of outputs) per input PDF, named after "
+        "the source PDF.\nCombined: every input PDF concatenated into one "
+        "output per format.",
+    "combined_name":
+        "Base filename used in Combined mode. The format extension "
+        "(.md, .pdf, .json, ...) is appended automatically per selected format.",
+    "format_markdown":
+        "Markdown (.md). Preserves OCR-detected headings and reconstructs "
+        "tables as Markdown pipe-tables. Best for human reading or for "
+        "feeding to an LLM.",
+    "format_text":
+        "Plain text (.txt). Markdown markers removed; table rows are joined "
+        "with tabs. Best for piping into other tools.",
+    "format_json":
+        "JSON (.json). Per-page list of recognised words with text, "
+        "confidence, and bounding box. Best for programmatic processing.",
+    "format_csv":
+        "CSV (.csv). One row per recognised word with page, position, size, "
+        "confidence, and text. Open in Excel/Sheets for analysis.",
+    "format_html":
+        "Self-contained HTML (.html). Styled tables, opens in any browser, "
+        "easy to share by email.",
+    "format_searchable_pdf":
+        "Searchable PDF (.pdf). Keeps the original page image and overlays "
+        "an invisible OCR text layer, so the file looks identical to the "
+        "source but text is copy-pasteable and Ctrl+F searchable.",
+    "open_when_done":    "When processing finishes, open the output folder in Explorer.",
+    "show_notify":       "Pop up a Done/Failed dialog at the end of the run.",
+
+    # ---- OCR tab ----
+    "tesseract_path":
+        "Path to tesseract.exe. The portable .exe ships with a sibling "
+        "'tesseract' folder that is auto-detected. Otherwise, point this at "
+        r"your install, e.g. C:\Program Files\Tesseract-OCR\tesseract.exe.",
+    "lang":
+        "Tesseract language code(s). 'eng' = English. Combine with '+' for "
+        "multiple, e.g. 'eng+fra'. Each language requires the matching "
+        ".traineddata file in tessdata/.",
+    "preset":
+        "Apply a starting-point set of values across the OCR, Preprocessing, "
+        "and Layout tabs. Pick the one closest to your document, then tweak.",
+    "psm":
+        "Page segmentation mode — how Tesseract should look at the page:\n"
+        "  3  fully automatic (general documents)\n"
+        "  4  single column of variable-sized text\n"
+        "  6  single uniform block of text (good for tables)\n"
+        " 11  sparse text, find as much as possible\n"
+        " 12  sparse text with orientation/script detection",
+    "oem":
+        "OCR engine mode:\n"
+        "  0  legacy engine only\n"
+        "  1  LSTM neural net only\n"
+        "  2  legacy + LSTM combined\n"
+        "  3  default (whatever is best in your Tesseract build, usually LSTM)",
+    "render_scale":
+        "How much to upscale each PDF page before OCR. 1.0 = original 72 DPI; "
+        "5.0 ≈ 360 DPI. Higher catches smaller text but uses more memory and "
+        "is slower. Try 3-6 for typical CMM/report PDFs.",
+    "min_conf":
+        "Drop individual words whose Tesseract confidence is below this "
+        "value (0-100). Higher = stricter, fewer noisy words but you may "
+        "miss faint text. 20 is a sensible default.",
+    "pages":
+        "Which pages to OCR. Examples: '1' · '1,3,5' · '1-5' · '1,3,5-7'. "
+        "Leave blank to process every page.",
+
+    # ---- Preprocessing tab ----
+    "no_grayscale":
+        "Skip the grayscale conversion and feed Tesseract the original RGB "
+        "image. Usually leave UNCHECKED — grayscale OCRs better in nearly "
+        "every case.",
+    "contrast":
+        "Multiply image contrast. 1.0 = unchanged. Values above 1 make "
+        "blacks darker and whites whiter, helping faded text. Try 1.4-1.8 "
+        "for low-contrast scans. Very high values (>2.5) can crush "
+        "mid-tones and merge characters.",
+    "sharpen":
+        "Number of sharpen passes applied to the rendered page. 0 = none; "
+        "1-2 helps small text. More than 3 introduces ringing artefacts "
+        "that hurt OCR.",
+    "threshold":
+        "How to binarise the image (force every pixel to black or white) "
+        "before OCR:\n"
+        "  none      — keep grayscale, let Tesseract decide\n"
+        "  global    — single cutoff value; fast but bad with uneven lighting\n"
+        "  adaptive  — local cutoff per region; best for real scans (recommended)",
+    "threshold_value":
+        "Cutoff used when threshold = global. Pixels darker than this value "
+        "(0-255) become black, lighter ones become white. 180 is a good "
+        "starting point for typical scans.",
+    "invert":
+        "Swap black and white after thresholding. Use only for white-on-black "
+        "source pages (rare).",
+    "dilate":
+        "Pixel dilation kernel size. >0 thickens text strokes — helps when "
+        "characters break apart from very thin printing. Start at 1; kernels "
+        "above 3 cause neighbouring characters to merge.",
+    "erode":
+        "Pixel erosion kernel size. >0 thins text strokes — helps when "
+        "characters blob together. In practice you use either dilate OR "
+        "erode, not both. Usually leave at 0.",
+    "crop":
+        "Crop pixels off each rendered page before OCR. Format "
+        "'left,top,right,bottom', e.g. '50,100,50,80' trims 50 px from each "
+        "side, 100 from the top, 80 from the bottom. Useful to drop headers, "
+        "footers, or borders. Leave blank for no crop.",
+
+    # ---- Layout & Noise tab ----
+    "row_tol":
+        "Vertical pixel tolerance for grouping OCR words into the same text "
+        "row. Lower = stricter (words must be vertically very close). Raise "
+        "if one line gets split in two; lower if two close lines merge.",
+    "col_gap":
+        "Minimum horizontal pixel gap that triggers a new table cell. "
+        "Smaller = more columns detected. Set very high (e.g. 999) for "
+        "plain prose where you don't want any column splitting.",
+    "noise_conf":
+        "Discard whole rows whose average word confidence is below this "
+        "value (0-100). 55 is a sensible default. Raise to drop more "
+        "borderline-junk rows; lower to keep more.",
+    "alpha_ratio":
+        "Drop rows whose alphanumeric ratio (letters+digits ÷ all chars) "
+        "is below this value. 0.3 means at least 30% of the line must be "
+        "letters or digits, otherwise it's treated as drawing/symbol noise. "
+        "Lower to keep more symbol-heavy lines.",
+
+    # ---- Diagnostics tab ----
+    "debug_dir":
+        "Folder where debug artefacts are written: rendered/processed PNGs, "
+        "per-word confidence CSV, raw Tesseract text. Leave blank to disable. "
+        "Very useful when tuning preprocessing or noise settings.",
+    "save_raw":
+        "Also save Tesseract's raw, un-postprocessed text into the debug "
+        "folder. Lets you see what OCR really saw before noise filtering "
+        "and row reconstruction.",
+    "conf_comments":
+        "Embed an HTML comment '<!-- OCR avg confidence: 87.3 -->' after "
+        "each row in Markdown output. Helps identify rows OCR was unsure about.",
+}
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 class OcrApp(tk.Tk):
@@ -630,11 +856,19 @@ class OcrApp(tk.Tk):
         menubar.add_cascade(label="File", menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="Settings reference...", command=self._show_settings_reference)
         help_menu.add_command(label="Tesseract status...", command=self._show_tesseract_status)
+        help_menu.add_separator()
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.config(menu=menubar)
+
+    # ---- tooltip helper ----
+    def _tip(self, widget, key: str) -> None:
+        text = TOOLTIPS.get(key)
+        if text:
+            Tooltip(widget, text)
 
     # ---- main layout ----
     def _build_widgets(self) -> None:
@@ -697,7 +931,8 @@ class OcrApp(tk.Tk):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Input PDFs:").grid(row=0, column=0, sticky="w")
+        files_label = ttk.Label(parent, text="Input PDFs:  (hover any setting for help)")
+        files_label.grid(row=0, column=0, sticky="w")
 
         list_frame = ttk.Frame(parent)
         list_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(2, 6))
@@ -709,231 +944,307 @@ class OcrApp(tk.Tk):
         sb = ttk.Scrollbar(list_frame, command=self._files_list.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self._files_list.configure(yscrollcommand=sb.set)
+        self._tip(self._files_list, "files_list")
+        self._tip(files_label, "files_list")
 
         side = ttk.Frame(list_frame)
         side.grid(row=0, column=2, sticky="ns", padx=(6, 0))
-        ttk.Button(side, text="Add files...", command=self._add_files).pack(fill="x")
-        ttk.Button(side, text="Add folder...", command=self._add_folder).pack(fill="x", pady=(4, 0))
-        ttk.Button(side, text="Remove", command=self._remove_selected).pack(fill="x", pady=(4, 0))
-        ttk.Button(side, text="Clear", command=self._clear_files).pack(fill="x", pady=(4, 0))
-        ttk.Button(side, text="Move up", command=lambda: self._move_selected(-1)).pack(fill="x", pady=(12, 0))
-        ttk.Button(side, text="Move down", command=lambda: self._move_selected(1)).pack(fill="x", pady=(4, 0))
+        b_add = ttk.Button(side, text="Add files...", command=self._add_files); b_add.pack(fill="x")
+        b_addf = ttk.Button(side, text="Add folder...", command=self._add_folder); b_addf.pack(fill="x", pady=(4, 0))
+        b_rm = ttk.Button(side, text="Remove", command=self._remove_selected); b_rm.pack(fill="x", pady=(4, 0))
+        b_clear = ttk.Button(side, text="Clear", command=self._clear_files); b_clear.pack(fill="x", pady=(4, 0))
+        b_up = ttk.Button(side, text="Move up", command=lambda: self._move_selected(-1)); b_up.pack(fill="x", pady=(12, 0))
+        b_dn = ttk.Button(side, text="Move down", command=lambda: self._move_selected(1)); b_dn.pack(fill="x", pady=(4, 0))
+        self._tip(b_add, "add_files")
+        self._tip(b_addf, "add_folder")
+        self._tip(b_rm, "remove")
+        self._tip(b_clear, "clear")
+        self._tip(b_up, "move_up")
+        self._tip(b_dn, "move_down")
 
         # output
         out_box = ttk.LabelFrame(parent, text="Output", padding=6)
         out_box.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         out_box.columnconfigure(1, weight=1)
 
-        ttk.Label(out_box, text="Folder:").grid(row=0, column=0, sticky="w")
+        lbl_folder = ttk.Label(out_box, text="Folder:"); lbl_folder.grid(row=0, column=0, sticky="w")
         self._out_dir_var = tk.StringVar()
-        ttk.Entry(out_box, textvariable=self._out_dir_var).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ent_dir = ttk.Entry(out_box, textvariable=self._out_dir_var)
+        ent_dir.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(out_box, text="Browse...", command=self._pick_output_dir).grid(row=0, column=2)
+        self._tip(lbl_folder, "output_dir"); self._tip(ent_dir, "output_dir")
 
-        ttk.Label(out_box, text="Mode:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        lbl_mode = ttk.Label(out_box, text="Mode:"); lbl_mode.grid(row=1, column=0, sticky="w", pady=(4, 0))
         mode_row = ttk.Frame(out_box)
         mode_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=(4, 0))
         self._mode_var = tk.StringVar(value="per_file")
-        ttk.Radiobutton(mode_row, text="One output per PDF", value="per_file", variable=self._mode_var
-                        ).pack(side="left")
-        ttk.Radiobutton(mode_row, text="Combined into one file", value="combined", variable=self._mode_var
-                        ).pack(side="left", padx=(12, 0))
+        rb_per = ttk.Radiobutton(mode_row, text="One output per PDF", value="per_file", variable=self._mode_var)
+        rb_per.pack(side="left")
+        rb_comb = ttk.Radiobutton(mode_row, text="Combined into one file", value="combined", variable=self._mode_var)
+        rb_comb.pack(side="left", padx=(12, 0))
+        self._tip(lbl_mode, "output_mode"); self._tip(rb_per, "output_mode"); self._tip(rb_comb, "output_mode")
 
-        ttk.Label(out_box, text="Combined name:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        lbl_cname = ttk.Label(out_box, text="Combined name:"); lbl_cname.grid(row=2, column=0, sticky="w", pady=(4, 0))
         self._combined_name_var = tk.StringVar(value="ocr_output")
-        ttk.Entry(out_box, textvariable=self._combined_name_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", pady=(4, 0), padx=(4, 0)
-        )
+        ent_cname = ttk.Entry(out_box, textvariable=self._combined_name_var)
+        ent_cname.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(4, 0), padx=(4, 0))
+        self._tip(lbl_cname, "combined_name"); self._tip(ent_cname, "combined_name")
 
-        ttk.Label(out_box, text="Formats:").grid(row=3, column=0, sticky="nw", pady=(8, 0))
+        lbl_fmt = ttk.Label(out_box, text="Formats:"); lbl_fmt.grid(row=3, column=0, sticky="nw", pady=(8, 0))
         fmt_frame = ttk.Frame(out_box)
         fmt_frame.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
         self._fmt_vars: Dict[str, tk.BooleanVar] = {}
         for i, (key, label, _ext) in enumerate(OUTPUT_FORMATS):
             var = tk.BooleanVar(value=(key == "markdown"))
             self._fmt_vars[key] = var
-            ttk.Checkbutton(fmt_frame, text=label, variable=var).grid(
-                row=i // 3, column=i % 3, sticky="w", padx=(0, 12)
-            )
+            cb = ttk.Checkbutton(fmt_frame, text=label, variable=var)
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
+            self._tip(cb, f"format_{key}")
 
         # finished options
         misc = ttk.Frame(out_box)
         misc.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self._open_when_done_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(misc, text="Open output folder when done",
-                        variable=self._open_when_done_var).pack(side="left")
+        cb_open = ttk.Checkbutton(misc, text="Open output folder when done",
+                                  variable=self._open_when_done_var)
+        cb_open.pack(side="left")
         self._show_notify_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(misc, text="Show notification when done",
-                        variable=self._show_notify_var).pack(side="left", padx=(12, 0))
+        cb_notify = ttk.Checkbutton(misc, text="Show notification when done",
+                                    variable=self._show_notify_var)
+        cb_notify.pack(side="left", padx=(12, 0))
+        self._tip(cb_open, "open_when_done"); self._tip(cb_notify, "show_notify")
 
     # ---- "OCR" tab ----
     def _build_ocr_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Tesseract executable:").grid(row=0, column=0, sticky="w")
+        def labelled(row: int, label_text: str, tip_key: str) -> ttk.Label:
+            lbl = ttk.Label(parent, text=label_text)
+            lbl.grid(row=row, column=0, sticky="w", pady=(0 if row == 0 else 6, 0))
+            self._tip(lbl, tip_key)
+            return lbl
+
+        labelled(0, "Tesseract executable:", "tesseract_path")
         self._tess_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self._tess_var).grid(row=0, column=1, sticky="ew", padx=4)
+        ent_tess = ttk.Entry(parent, textvariable=self._tess_var)
+        ent_tess.grid(row=0, column=1, sticky="ew", padx=4)
+        self._tip(ent_tess, "tesseract_path")
         btn_row = ttk.Frame(parent)
         btn_row.grid(row=0, column=2, sticky="e")
         ttk.Button(btn_row, text="Browse...", command=self._pick_tesseract).pack(side="left")
         ttk.Button(btn_row, text="Auto-detect", command=self._auto_detect_tesseract).pack(side="left", padx=(4, 0))
         ttk.Button(btn_row, text="Test", command=self._show_tesseract_status).pack(side="left", padx=(4, 0))
 
-        ttk.Label(parent, text="Language(s):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        labelled(1, "Language(s):", "lang")
         self._lang_var = tk.StringVar(value="eng")
-        ttk.Entry(parent, textvariable=self._lang_var).grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
-        ttk.Label(parent, text='e.g. "eng" or "eng+deu"').grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ent_lang = ttk.Entry(parent, textvariable=self._lang_var)
+        ent_lang.grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Label(parent, text='e.g. "eng" or "eng+deu"').grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self._tip(ent_lang, "lang")
 
-        ttk.Label(parent, text="Preset:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        labelled(2, "Preset:", "preset")
         self._preset_var = tk.StringVar(value="Default")
         preset_box = ttk.Combobox(parent, textvariable=self._preset_var,
                                   values=list(PRESETS.keys()), state="readonly")
-        preset_box.grid(row=2, column=1, sticky="ew", padx=4, pady=(8, 0))
+        preset_box.grid(row=2, column=1, sticky="ew", padx=4, pady=(6, 0))
         preset_box.bind("<<ComboboxSelected>>", self._on_apply_builtin_preset)
-        ttk.Label(parent, text="Built-in starting points").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(parent, text="Built-in starting points").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self._tip(preset_box, "preset")
 
-        ttk.Label(parent, text="Page segmentation (PSM):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        labelled(3, "Page segmentation (PSM):", "psm")
         self._psm_var = tk.IntVar(value=6)
-        ttk.Combobox(parent, textvariable=self._psm_var,
-                     values=[3, 4, 6, 11, 12], state="readonly", width=6).grid(
-            row=3, column=1, sticky="w", padx=4, pady=(8, 0)
-        )
+        psm_box = ttk.Combobox(parent, textvariable=self._psm_var,
+                               values=[3, 4, 6, 11, 12], state="readonly", width=6)
+        psm_box.grid(row=3, column=1, sticky="w", padx=4, pady=(6, 0))
         ttk.Label(parent, text="6=block, 4=column, 3=auto, 11/12=sparse").grid(
-            row=3, column=2, sticky="w", pady=(8, 0)
-        )
+            row=3, column=2, sticky="w", pady=(6, 0))
+        self._tip(psm_box, "psm")
 
-        ttk.Label(parent, text="OCR engine (OEM):").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        labelled(4, "OCR engine (OEM):", "oem")
         self._oem_var = tk.IntVar(value=3)
-        ttk.Combobox(parent, textvariable=self._oem_var,
-                     values=[0, 1, 2, 3], state="readonly", width=6).grid(
-            row=4, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
-        ttk.Label(parent, text="3=default LSTM").grid(row=4, column=2, sticky="w", pady=(4, 0))
+        oem_box = ttk.Combobox(parent, textvariable=self._oem_var,
+                               values=[0, 1, 2, 3], state="readonly", width=6)
+        oem_box.grid(row=4, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="3 = default LSTM").grid(row=4, column=2, sticky="w", pady=(6, 0))
+        self._tip(oem_box, "oem")
 
-        ttk.Label(parent, text="Render scale:").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        labelled(5, "Render scale:", "render_scale")
         self._render_var = tk.DoubleVar(value=5.0)
-        ttk.Spinbox(parent, from_=1.0, to=10.0, increment=0.5,
-                    textvariable=self._render_var, width=8).grid(
-            row=5, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
-        ttk.Label(parent, text="3-6 for small text").grid(row=5, column=2, sticky="w", pady=(4, 0))
+        sp_render = ttk.Spinbox(parent, from_=1.0, to=10.0, increment=0.5,
+                                textvariable=self._render_var, width=8)
+        sp_render.grid(row=5, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="3-6 for small text; higher = slower").grid(
+            row=5, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp_render, "render_scale")
 
-        ttk.Label(parent, text="Min word confidence:").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        labelled(6, "Min word confidence:", "min_conf")
         self._min_conf_var = tk.DoubleVar(value=20.0)
-        ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
-                    textvariable=self._min_conf_var, width=8).grid(
-            row=6, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
-        ttk.Label(parent, text="0-100").grid(row=6, column=2, sticky="w", pady=(4, 0))
+        sp_conf = ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
+                              textvariable=self._min_conf_var, width=8)
+        sp_conf.grid(row=6, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="0-100; higher = stricter").grid(
+            row=6, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp_conf, "min_conf")
 
-        ttk.Label(parent, text="Pages:").grid(row=7, column=0, sticky="w", pady=(4, 0))
+        labelled(7, "Pages:", "pages")
         self._pages_var = tk.StringVar(value="")
-        ttk.Entry(parent, textvariable=self._pages_var).grid(
-            row=7, column=1, sticky="ew", padx=4, pady=(4, 0)
-        )
+        ent_pages = ttk.Entry(parent, textvariable=self._pages_var)
+        ent_pages.grid(row=7, column=1, sticky="ew", padx=4, pady=(6, 0))
         ttk.Label(parent, text="e.g. 1,2,4-5 (blank = all)").grid(
-            row=7, column=2, sticky="w", pady=(4, 0)
-        )
+            row=7, column=2, sticky="w", pady=(6, 0))
+        self._tip(ent_pages, "pages")
 
     # ---- "Preprocessing" tab ----
     def _build_prep_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
+        def lbl(row: int, text: str, tip_key: str) -> None:
+            w = ttk.Label(parent, text=text)
+            w.grid(row=row, column=0, sticky="w", pady=(0 if row == 0 else 6, 0))
+            self._tip(w, tip_key)
+
         self._no_gray_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(parent, text="Keep RGB (skip grayscale conversion)",
-                        variable=self._no_gray_var).grid(row=0, column=0, columnspan=2, sticky="w")
+        cb_gray = ttk.Checkbutton(parent, text="Keep RGB (skip grayscale conversion)",
+                                  variable=self._no_gray_var)
+        cb_gray.grid(row=0, column=0, columnspan=2, sticky="w")
+        self._tip(cb_gray, "no_grayscale")
 
-        ttk.Label(parent, text="Contrast:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        lbl(1, "Contrast:", "contrast")
         self._contrast_var = tk.DoubleVar(value=1.4)
-        ttk.Spinbox(parent, from_=0.5, to=4.0, increment=0.1,
-                    textvariable=self._contrast_var, width=8).grid(
-            row=1, column=1, sticky="w", padx=4, pady=(8, 0)
-        )
+        sp = ttk.Spinbox(parent, from_=0.5, to=4.0, increment=0.1,
+                         textvariable=self._contrast_var, width=8)
+        sp.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="1.0 = unchanged; 1.4-1.8 for faded scans").grid(
+            row=1, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "contrast")
 
-        ttk.Label(parent, text="Sharpen passes:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        lbl(2, "Sharpen passes:", "sharpen")
         self._sharpen_var = tk.IntVar(value=1)
-        ttk.Spinbox(parent, from_=0, to=5, increment=1,
-                    textvariable=self._sharpen_var, width=8).grid(
-            row=2, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        sp = ttk.Spinbox(parent, from_=0, to=5, increment=1,
+                         textvariable=self._sharpen_var, width=8)
+        sp.grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="0=none, 1-2 helps small text").grid(
+            row=2, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "sharpen")
 
-        ttk.Label(parent, text="Threshold:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        lbl(3, "Threshold:", "threshold")
         self._thresh_var = tk.StringVar(value="adaptive")
-        ttk.Combobox(parent, textvariable=self._thresh_var,
-                     values=["none", "global", "adaptive"], state="readonly", width=10).grid(
-            row=3, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        cb = ttk.Combobox(parent, textvariable=self._thresh_var,
+                          values=["none", "global", "adaptive"], state="readonly", width=10)
+        cb.grid(row=3, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="adaptive recommended for real scans").grid(
+            row=3, column=2, sticky="w", pady=(6, 0))
+        self._tip(cb, "threshold")
 
-        ttk.Label(parent, text="Threshold value:").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        lbl(4, "Threshold value:", "threshold_value")
         self._thresh_val_var = tk.IntVar(value=180)
-        ttk.Spinbox(parent, from_=0, to=255, increment=5,
-                    textvariable=self._thresh_val_var, width=8).grid(
-            row=4, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        sp = ttk.Spinbox(parent, from_=0, to=255, increment=5,
+                         textvariable=self._thresh_val_var, width=8)
+        sp.grid(row=4, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="only used when threshold = global (0-255)").grid(
+            row=4, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "threshold_value")
 
         self._invert_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(parent, text="Invert colours after preprocessing",
-                        variable=self._invert_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        cb_inv = ttk.Checkbutton(parent, text="Invert colours after preprocessing",
+                                 variable=self._invert_var)
+        cb_inv.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._tip(cb_inv, "invert")
 
-        ttk.Label(parent, text="Dilate kernel:").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        lbl(6, "Dilate kernel:", "dilate")
         self._dilate_var = tk.IntVar(value=1)
-        ttk.Spinbox(parent, from_=0, to=10, increment=1,
-                    textvariable=self._dilate_var, width=8).grid(
-            row=6, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        sp = ttk.Spinbox(parent, from_=0, to=10, increment=1,
+                         textvariable=self._dilate_var, width=8)
+        sp.grid(row=6, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="thickens strokes; raise if characters break apart").grid(
+            row=6, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "dilate")
 
-        ttk.Label(parent, text="Erode kernel:").grid(row=7, column=0, sticky="w", pady=(4, 0))
+        lbl(7, "Erode kernel:", "erode")
         self._erode_var = tk.IntVar(value=0)
-        ttk.Spinbox(parent, from_=0, to=10, increment=1,
-                    textvariable=self._erode_var, width=8).grid(
-            row=7, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        sp = ttk.Spinbox(parent, from_=0, to=10, increment=1,
+                         textvariable=self._erode_var, width=8)
+        sp.grid(row=7, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="thins strokes; raise if characters merge").grid(
+            row=7, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "erode")
 
-        ttk.Label(parent, text="Crop (l,t,r,b px):").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        lbl(8, "Crop (l,t,r,b px):", "crop")
         self._crop_var = tk.StringVar(value="")
-        ttk.Entry(parent, textvariable=self._crop_var).grid(
-            row=8, column=1, sticky="ew", padx=4, pady=(4, 0)
-        )
+        ent_crop = ttk.Entry(parent, textvariable=self._crop_var)
+        ent_crop.grid(row=8, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="e.g. 50,100,50,80 — blank for no crop").grid(
+            row=8, column=2, sticky="w", pady=(6, 0))
+        self._tip(ent_crop, "crop")
 
     # ---- "Layout & Noise" tab ----
     def _build_layout_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Row tolerance (px):").grid(row=0, column=0, sticky="w")
+        def lbl(row: int, text: str, tip_key: str) -> None:
+            w = ttk.Label(parent, text=text)
+            w.grid(row=row, column=0, sticky="w", pady=(0 if row == 0 else 6, 0))
+            self._tip(w, tip_key)
+
+        lbl(0, "Row tolerance (px):", "row_tol")
         self._row_tol_var = tk.IntVar(value=12)
-        ttk.Spinbox(parent, from_=1, to=80, increment=1,
-                    textvariable=self._row_tol_var, width=8).grid(row=0, column=1, sticky="w", padx=4)
+        sp = ttk.Spinbox(parent, from_=1, to=80, increment=1,
+                         textvariable=self._row_tol_var, width=8)
+        sp.grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(parent, text="raise if one line splits in two").grid(
+            row=0, column=2, sticky="w")
+        self._tip(sp, "row_tol")
 
-        ttk.Label(parent, text="Column gap (px):").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        lbl(1, "Column gap (px):", "col_gap")
         self._col_gap_var = tk.IntVar(value=22)
-        ttk.Spinbox(parent, from_=1, to=999, increment=1,
-                    textvariable=self._col_gap_var, width=8).grid(row=1, column=1, sticky="w", padx=4, pady=(4, 0))
+        sp = ttk.Spinbox(parent, from_=1, to=999, increment=1,
+                         textvariable=self._col_gap_var, width=8)
+        sp.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="set very high to disable column splitting").grid(
+            row=1, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "col_gap")
 
-        ttk.Label(parent, text="Row noise conf cutoff:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        lbl(2, "Row noise conf cutoff:", "noise_conf")
         self._noise_conf_var = tk.DoubleVar(value=55.0)
-        ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
-                    textvariable=self._noise_conf_var, width=8).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
+        sp = ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
+                         textvariable=self._noise_conf_var, width=8)
+        sp.grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="rows below this avg conf are dropped").grid(
+            row=2, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "noise_conf")
 
-        ttk.Label(parent, text="Min alphanumeric ratio:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        lbl(3, "Min alphanumeric ratio:", "alpha_ratio")
         self._alpha_ratio_var = tk.DoubleVar(value=0.3)
-        ttk.Spinbox(parent, from_=0.0, to=1.0, increment=0.05,
-                    textvariable=self._alpha_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=4, pady=(4, 0))
+        sp = ttk.Spinbox(parent, from_=0.0, to=1.0, increment=0.05,
+                         textvariable=self._alpha_ratio_var, width=8)
+        sp.grid(row=3, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="0.3 = at least 30% letters/digits").grid(
+            row=3, column=2, sticky="w", pady=(6, 0))
+        self._tip(sp, "alpha_ratio")
 
     # ---- "Diagnostics" tab ----
     def _build_diag_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Debug folder:").grid(row=0, column=0, sticky="w")
+        lbl_dbg = ttk.Label(parent, text="Debug folder:")
+        lbl_dbg.grid(row=0, column=0, sticky="w")
         self._debug_dir_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self._debug_dir_var).grid(row=0, column=1, sticky="ew", padx=4)
+        ent_dbg = ttk.Entry(parent, textvariable=self._debug_dir_var)
+        ent_dbg.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(parent, text="Browse...", command=self._pick_debug_dir).grid(row=0, column=2)
+        self._tip(lbl_dbg, "debug_dir"); self._tip(ent_dbg, "debug_dir")
 
         self._save_raw_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(parent, text="Save raw Tesseract text into debug folder",
-                        variable=self._save_raw_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        cb_raw = ttk.Checkbutton(parent, text="Save raw Tesseract text into debug folder",
+                                 variable=self._save_raw_var)
+        cb_raw.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._tip(cb_raw, "save_raw")
 
         self._conf_comments_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(parent, text="Include per-row OCR confidence comments in Markdown",
-                        variable=self._conf_comments_var).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        cb_cc = ttk.Checkbutton(parent, text="Include per-row OCR confidence comments in Markdown",
+                                variable=self._conf_comments_var)
+        cb_cc.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._tip(cb_cc, "conf_comments")
 
     # ---- file/folder pickers ----
     def _add_files(self) -> None:
@@ -1104,6 +1415,93 @@ class OcrApp(tk.Tk):
             "Tkinter front-end for OCR_PDF_to_Markdown.py.\n"
             "Uses PyMuPDF, Pillow, pytesseract, OpenCV.\n"
         )
+
+    def _show_settings_reference(self) -> None:
+        """Open a scrollable window that explains every setting, grouped by tab."""
+        win = tk.Toplevel(self)
+        win.title("Settings reference")
+        win.geometry("760x620")
+        win.transient(self)
+
+        outer = ttk.Frame(win, padding=8)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="Hover over any field in the main window for the same help. "
+                 "This reference lists every setting in one place.",
+            wraplength=720, justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        text_frame = ttk.Frame(outer)
+        text_frame.pack(fill="both", expand=True)
+        txt = tk.Text(text_frame, wrap="word", font=("Segoe UI", 10))
+        txt.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(text_frame, command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.configure(yscrollcommand=sb.set)
+
+        txt.tag_configure("h1", font=("Segoe UI", 12, "bold"), spacing3=4, spacing1=8)
+        txt.tag_configure("h2", font=("Segoe UI", 10, "bold"), spacing3=2, spacing1=4)
+        txt.tag_configure("body", lmargin1=12, lmargin2=12, spacing3=6)
+
+        groups: List[Tuple[str, List[Tuple[str, str]]]] = [
+            ("Files & Output", [
+                ("Input queue",          "files_list"),
+                ("Output folder",        "output_dir"),
+                ("Output mode",          "output_mode"),
+                ("Combined filename",    "combined_name"),
+                ("Format: Markdown",     "format_markdown"),
+                ("Format: Plain text",   "format_text"),
+                ("Format: JSON",         "format_json"),
+                ("Format: CSV",          "format_csv"),
+                ("Format: HTML",         "format_html"),
+                ("Format: Searchable PDF","format_searchable_pdf"),
+                ("Open folder when done","open_when_done"),
+                ("Notification",         "show_notify"),
+            ]),
+            ("OCR", [
+                ("Tesseract executable", "tesseract_path"),
+                ("Language(s)",          "lang"),
+                ("Preset",               "preset"),
+                ("Page segmentation (PSM)","psm"),
+                ("OCR engine (OEM)",     "oem"),
+                ("Render scale",         "render_scale"),
+                ("Min word confidence",  "min_conf"),
+                ("Pages",                "pages"),
+            ]),
+            ("Preprocessing", [
+                ("Keep RGB",             "no_grayscale"),
+                ("Contrast",             "contrast"),
+                ("Sharpen passes",       "sharpen"),
+                ("Threshold",            "threshold"),
+                ("Threshold value",      "threshold_value"),
+                ("Invert",               "invert"),
+                ("Dilate kernel",        "dilate"),
+                ("Erode kernel",         "erode"),
+                ("Crop",                 "crop"),
+            ]),
+            ("Layout & Noise", [
+                ("Row tolerance",        "row_tol"),
+                ("Column gap",           "col_gap"),
+                ("Row noise conf cutoff","noise_conf"),
+                ("Min alphanumeric ratio","alpha_ratio"),
+            ]),
+            ("Diagnostics", [
+                ("Debug folder",         "debug_dir"),
+                ("Save raw text",        "save_raw"),
+                ("Confidence comments",  "conf_comments"),
+            ]),
+        ]
+
+        for group_title, items in groups:
+            txt.insert("end", group_title + "\n", "h1")
+            for label, key in items:
+                body = TOOLTIPS.get(key, "(no description)")
+                txt.insert("end", label + "\n", "h2")
+                txt.insert("end", body + "\n", "body")
+        txt.configure(state="disabled")
+
+        ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(6, 0))
 
     # ---- settings I/O ----
     def _collect_settings(self) -> OcrSettings:
