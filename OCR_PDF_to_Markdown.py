@@ -321,24 +321,104 @@ def tesseract_words(
     return words
 
 
+def words_from_embedded_text(
+    page, render_scale: float, crop: Tuple[int, int, int, int] = (0, 0, 0, 0),
+) -> List[OCRWord]:
+    """Pull word-level bounding boxes from a PDF's embedded text layer.
+
+    Returns the same :class:`OCRWord` shape that Tesseract produces, so the
+    rest of the pipeline (row grouping, column-aware splitting,
+    :func:`rows_to_markdown`) can reuse it verbatim. Confidence is reported
+    as 100 because the words come straight from the PDF, not OCR.
+
+    Coordinates are scaled to match the rendered-image coordinate system
+    that downstream code expects, then offset by the crop's top/left so
+    crop-relative comparisons keep working.
+    """
+    words: List[OCRWord] = []
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return words
+
+    cl, ct, _cr, _cb = crop
+    for block in data.get("blocks", []):
+        if block.get("type", 0) != 0:  # 0 = text block, 1 = image
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = (span.get("text") or "").strip()
+                if not text:
+                    continue
+                bx = span.get("bbox") or [0, 0, 0, 0]
+                x0, y0, x1, y1 = bx
+                # bbox is in PDF points (1 pt = 1/72"). Scale to rendered px.
+                # Split a multi-word span into per-word boxes proportionally.
+                tokens = text.split()
+                if not tokens:
+                    continue
+                span_w_pts = max(0.001, x1 - x0)
+                total_chars = sum(len(t) for t in tokens) + max(0, len(tokens) - 1)
+                cursor = x0
+                for tok in tokens:
+                    frac = (len(tok) + 1) / total_chars if total_chars else 1 / len(tokens)
+                    tok_x0 = cursor
+                    tok_x1 = cursor + span_w_pts * frac
+                    cursor = tok_x1
+                    rx = int(tok_x0 * render_scale) - cl
+                    ry = int(y0 * render_scale) - ct
+                    rw = max(1, int((tok_x1 - tok_x0) * render_scale))
+                    rh = max(1, int((y1 - y0) * render_scale))
+                    words.append(OCRWord(
+                        text=tok, conf=100.0,
+                        x=rx, y=ry, w=rw, h=rh,
+                    ))
+    return words
+
+
 def tesseract_words_voting(
     img: Image.Image, lang: str, oem: int, min_conf: float,
-    psms: Sequence[int] = (6, 4),
+    psms: Optional[Sequence[int]] = None,
+    user_psm: int = 6,
 ) -> List[OCRWord]:
-    """Run Tesseract once per PSM in ``psms`` and return the variant whose
-    average word confidence is highest. Slower (≈Nx) but more robust on pages
-    where the default PSM mis-segments the layout.
+    """Run Tesseract with multiple page-segmentation modes and pick the
+    result that found the most useful text.
+
+    The selector is ``word_count * min(avg_conf, 80) / 100`` rather than mean
+    confidence alone, because the old "highest mean conf" rule would prefer a
+    PSM that found *fewer* words in clean positions over one that found more
+    correct text with slightly noisier confidence.
+
+    If ``psms`` is omitted, the candidate set always includes ``user_psm``
+    so the user's PSM choice is respected, plus PSM 11 (sparse text) as a
+    complementary segmentation. PSM 4 is intentionally excluded — it treats
+    the page as one variable-width column and breaks the row/column table
+    reconstruction in :func:`rows_to_markdown`.
     """
+    if psms is None:
+        complement = 11 if user_psm != 11 else 6
+        candidates = [user_psm, complement]
+    else:
+        candidates = list(psms)
+
+    seen: List[int] = []
+    for p in candidates:
+        if p not in seen:
+            seen.append(p)
+
     best_words: List[OCRWord] = []
     best_score: float = -1.0
-    for psm in psms:
+    for psm in seen:
         try:
             words = tesseract_words(img, lang, psm, oem, min_conf)
         except Exception:
             continue
         if not words:
             continue
-        score = sum(w.conf for w in words) / len(words)
+        avg_conf = sum(w.conf for w in words) / len(words)
+        # Cap conf contribution at 80 so a tiny set of 95-conf words can't
+        # outscore a larger set of solid 75-conf words.
+        score = len(words) * min(avg_conf, 80.0) / 100.0
         if score > best_score:
             best_score = score
             best_words = words

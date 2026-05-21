@@ -490,46 +490,84 @@ def _ocr_page(item: PageWorkItem) -> PageResult:
             page = doc[item.page_index]
 
             # --- 1. Text-layer fast path -----------------------------------
-            if s.use_text_layer:
-                embedded = page.get_text("text") or ""
-                alnum = sum(c.isalnum() for c in embedded)
-                if len(embedded) >= 50 and alnum >= 20:
-                    md_chunk = (
-                        f"\n## Page {item.page_index + 1}\n"
-                        "<!-- source: embedded text layer -->\n"
-                        + embedded.strip() + "\n"
-                    )
-                    pdf_bytes = b""
-                    if "searchable_pdf" in item.formats:
-                        # render the page once just for the searchable PDF
-                        rendered = ocr_engine.render_page(page, s.render_scale)
-                        try:
-                            pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-                                rendered, lang=s.lang,
-                                config=f"--oem {s.oem} --psm {s.psm}",
-                                extension="pdf",
-                            )
-                        except Exception:
-                            pdf_bytes = b""
-                    return PageResult(
-                        pdf_path=item.pdf_path,
-                        page_index=item.page_index,
-                        used_text_layer=True,
-                        drawing_page=False,
-                        is_error=False, error="",
-                        elapsed_sec=time.perf_counter() - t0,
-                        md_chunk=md_chunk,
-                        raw_text=embedded,
-                        pdf_page_bytes=pdf_bytes,
-                        words=[],
-                        avg_conf=100.0,
-                        word_count=len(embedded.split()),
-                        rendered_size=(0, 0),
-                        deskew_applied=False,
-                    )
-
-            # --- 2. OCR path -----------------------------------------------
+            #
+            # When the PDF already has a real text layer (Word/Excel exports
+            # etc.) we'd rather use those exact characters than OCR a render
+            # of them. We pull *word-level* boxes via get_text("dict"), turn
+            # them into the same OCRWord shape Tesseract produces, then feed
+            # them through the normal row/column reconstruction pipeline.
+            # That gives perfect text AND aligned Markdown tables, instead of
+            # the unstructured stream-order dump the older code emitted.
             crop = ocr_engine.parse_crop(s.crop or None)
+            used_text_layer = False
+            embedded_words: List = []
+            if s.use_text_layer:
+                embedded_words = ocr_engine.words_from_embedded_text(
+                    page, s.render_scale, crop,
+                )
+                if embedded_words and len(embedded_words) >= 8:
+                    used_text_layer = True
+
+            # --- 2. Decide whether to OCR ----------------------------------
+            if used_text_layer:
+                rendered = None
+                pdf_bytes = b""
+                if "searchable_pdf" in item.formats:
+                    # Render once just for the searchable-PDF output.
+                    rendered = ocr_engine.render_page(page, s.render_scale)
+                    try:
+                        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                            rendered, lang=s.lang,
+                            config=f"--oem {s.oem} --psm {s.psm}",
+                            extension="pdf",
+                        )
+                    except Exception:
+                        pdf_bytes = b""
+
+                words = embedded_words
+                deskew_applied = False
+                # Reuse the table reconstruction we use for OCR'd words.
+                rows = ocr_engine.group_words_into_rows(
+                    words, y_tolerance=s.row_tol,
+                )
+                page_md = ocr_engine.rows_to_markdown(
+                    rows,
+                    gap=s.col_gap,
+                    noise_conf=s.noise_conf,
+                    noise_alpha_ratio=s.noise_alpha_ratio,
+                    include_confidence_comments=s.confidence_comments,
+                )
+                md_chunk = (
+                    f"\n## Page {item.page_index + 1}\n"
+                    "<!-- source: embedded PDF text layer -->\n"
+                    + page_md
+                )
+
+                word_records = [
+                    PageWordRecord(
+                        text=w.text, conf=round(w.conf, 2),
+                        x=w.x, y=w.y, w=w.w, h=w.h,
+                    )
+                    for w in words
+                ]
+                return PageResult(
+                    pdf_path=item.pdf_path,
+                    page_index=item.page_index,
+                    used_text_layer=True,
+                    drawing_page=False,
+                    is_error=False, error="",
+                    elapsed_sec=time.perf_counter() - t0,
+                    md_chunk=md_chunk,
+                    raw_text=page.get_text("text") or "",
+                    pdf_page_bytes=pdf_bytes,
+                    words=word_records,
+                    avg_conf=100.0,
+                    word_count=len(word_records),
+                    rendered_size=(rendered.size if rendered is not None else (0, 0)),
+                    deskew_applied=False,
+                )
+
+            # --- 3. OCR path -----------------------------------------------
             rendered = ocr_engine.render_page(page, s.render_scale)
             rendered = ocr_engine.crop_image(rendered, crop)
 
@@ -554,7 +592,8 @@ def _ocr_page(item: PageWorkItem) -> PageResult:
 
             if s.best_accuracy:
                 words = ocr_engine.tesseract_words_voting(
-                    processed, s.lang, s.oem, s.min_conf, psms=(6, 4),
+                    processed, s.lang, s.oem, s.min_conf,
+                    user_psm=s.psm,
                 )
             else:
                 words = ocr_engine.tesseract_words(
@@ -1136,16 +1175,19 @@ TOOLTIPS: Dict[str, str] = {
         "higher for batch runs on dedicated machines. Each worker uses memory "
         "for one rendered page at a time.",
     "use_text_layer":
-        "Many PDFs (anything exported from Word, Excel, etc.) already contain "
-        "real, perfectly accurate text. With this on, the tool detects those "
-        "pages and uses the embedded text directly instead of OCR'ing the "
-        "image — much faster and 100% accurate. Scanned/image-only PDFs are "
-        "OCR'd as before.",
+        "Many PDFs (Word/Excel exports etc.) already contain real, perfectly "
+        "accurate text with per-word positions. With this on, the tool pulls "
+        "those word boxes directly and runs them through the same row/column "
+        "reconstruction as OCR — so you get perfect text AND properly aligned "
+        "tables, much faster than re-OCR'ing. Scanned/image-only PDFs fall "
+        "back to OCR automatically.",
     "best_accuracy":
-        "Runs OCR multiple times per page with different segmentation "
-        "settings and keeps the result with the highest average confidence. "
-        "Roughly doubles processing time. Worthwhile for pages where the "
-        "default mis-reads a few words.",
+        "Runs Tesseract a second time with a complementary page-segmentation "
+        "mode (sparse text) alongside your selected PSM, then keeps whichever "
+        "found more correct text. Selection uses word count × confidence so a "
+        "run that finds more words wins over one that finds fewer with "
+        "slightly higher confidence. ~2x slower; helps on pages where the "
+        "default segmentation drops content.",
 
     # ---- Watch folder ----
     "watch_folder":
