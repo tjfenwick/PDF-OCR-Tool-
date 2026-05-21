@@ -3,12 +3,21 @@
 # Build:
 #   pyinstaller pdf_ocr_gui.spec
 #
-# The build script (build_exe.bat / build-exe.yml) populates ``tesseract/`` next
-# to this file before invoking PyInstaller. If that folder is present it is
-# bundled into the .exe distribution so end users do not have to install
-# Tesseract themselves.
+# Before building, the CI workflow (or local build script) populates these
+# directories next to the spec so PyInstaller can embed them:
+#   tesseract/          - portable Tesseract install (Windows)
+#   paddleocr_models/   - PaddleOCR detection/recognition model cache
+#   marker_models/      - HuggingFace cache for Marker / Surya models
+#
+# All three are optional. Missing directories are silently skipped — the
+# build still completes, just without that backend's models bundled.
 
 from pathlib import Path
+
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_submodules,
+)
 
 block_cipher = None
 
@@ -16,27 +25,62 @@ ROOT = Path(SPECPATH)
 
 datas = [
     (str(ROOT / 'OCR_PDF_to_Markdown.py'), '.'),
+    (str(ROOT / 'ocr_backends'), 'ocr_backends'),
 ]
 
 tess_dir = ROOT / 'tesseract'
 if tess_dir.exists():
     datas.append((str(tess_dir), 'tesseract'))
 
+paddle_models_dir = ROOT / 'paddleocr_models'
+if paddle_models_dir.exists():
+    datas.append((str(paddle_models_dir), 'paddleocr_models'))
+
+marker_models_dir = ROOT / 'marker_models'
+if marker_models_dir.exists():
+    datas.append((str(marker_models_dir), 'marker_models'))
+
+# Best-effort: include the package data files for the heavy backends so
+# PyInstaller doesn't drop dictionaries, fonts, configs, etc.
+for pkg in ('paddleocr', 'paddle', 'marker', 'surya', 'openai',
+            'transformers', 'tokenizers', 'safetensors'):
+    try:
+        datas += collect_data_files(pkg)
+    except Exception:
+        pass
+
+hiddenimports: list = [
+    'OCR_PDF_to_Markdown',
+    'PIL._tkinter_finder',
+    'cv2',
+    'numpy',
+    # OCR backends — keep these importable even when PyInstaller can't trace
+    # them statically (they're loaded via string lookup in ocr_backends.get_backend).
+    'ocr_backends',
+    'ocr_backends.tesseract_backend',
+    'ocr_backends.paddleocr_backend',
+    'ocr_backends.marker_backend',
+    'ocr_backends.qwen_backend',
+    'openai',
+]
+
+# Pick up submodules of the heavy ML packages PyInstaller often misses.
+for pkg in ('paddleocr', 'paddle', 'marker', 'surya', 'transformers'):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception:
+        pass
+
 a = Analysis(
     ['pdf_ocr_gui.py'],
     pathex=[str(ROOT)],
     binaries=[],
     datas=datas,
-    hiddenimports=[
-        'OCR_PDF_to_Markdown',
-        'PIL._tkinter_finder',
-        'cv2',
-        'numpy',
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / 'hooks' / 'runtime_models.py')],
     excludes=[
-        'matplotlib', 'scipy', 'pandas',
+        'matplotlib',
         'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
         'IPython', 'jupyter',
     ],

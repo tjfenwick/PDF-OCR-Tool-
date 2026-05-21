@@ -12,6 +12,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (incl. all OCR backends)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
@@ -51,14 +52,18 @@ jobs:
           Write-Host "Copying Tesseract from $src"
           Copy-Item -Path $src -Destination "tesseract" -Recurse
           # Trim heavy unused language packs to keep the bundle small.
-          # Keep English by default; users can drop more .traineddata files
-          # into PDF-OCR-Tool\tesseract\tessdata at runtime.
           $tessdata = "tesseract\tessdata"
           if (Test-Path $tessdata) {
             Get-ChildItem $tessdata -Filter "*.traineddata" |
               Where-Object { $_.BaseName -notin @("eng", "osd") } |
               Remove-Item -Force
           }
+
+      - name: Pre-fetch PaddleOCR and Marker model caches
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          python prefetch_models.py
 
       - name: Build with PyInstaller
         run: pyinstaller pdf_ocr_gui.spec
