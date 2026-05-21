@@ -626,6 +626,83 @@ def split_row_by_gaps(row: OCRRow, min_gap: int = 22) -> List[str]:
     return [normalize_cell(c) for c in cells if c.strip()]
 
 
+def _column_ranges_from_header(
+    header_row: OCRRow, min_gap: int = 22,
+) -> List[Tuple[int, int]]:
+    """Derive ``(left, right)`` X-pixel ranges, one per column, from a header
+    row. Uses the same gap-splitting logic as :func:`split_row_by_gaps`, but
+    operates on word bounding boxes so we can map data-row words back to the
+    correct column even when some cells are empty.
+
+    Boundary placement:
+      * The boundary between adjacent columns sits at the midpoint of the
+        white gap between the two header cells.
+      * The first column extends left to 0; the last column extends right to
+        a large sentinel — so words that drift past the visible header edges
+        still get bucketed.
+    """
+    words = sorted(header_row.words, key=lambda w: w.x)
+    if not words:
+        return []
+
+    # Group header words into cells (same heuristic as split_row_by_gaps but
+    # we keep the OCRWord objects so we know each cell's x-range).
+    cells: List[List[OCRWord]] = [[words[0]]]
+    for w in words[1:]:
+        if w.x - cells[-1][-1].x2 >= min_gap:
+            cells.append([w])
+        else:
+            cells[-1].append(w)
+
+    cell_bounds: List[Tuple[int, int]] = [
+        (cell[0].x, cell[-1].x2) for cell in cells
+    ]
+
+    ranges: List[Tuple[int, int]] = []
+    for i, (left, right) in enumerate(cell_bounds):
+        lo = 0 if i == 0 else (cell_bounds[i - 1][1] + left) // 2
+        hi = (10 ** 9
+              if i == len(cell_bounds) - 1
+              else (right + cell_bounds[i + 1][0]) // 2)
+        ranges.append((lo, hi))
+    return ranges
+
+
+def split_row_by_columns(
+    row: OCRRow, ranges: List[Tuple[int, int]],
+) -> List[str]:
+    """Bucket each word in ``row`` into the column whose X-range contains
+    the word's X-midpoint. Returns exactly ``len(ranges)`` normalised cell
+    strings, including empty strings for columns that contained no words.
+
+    This is the fix for the "blank cell shifts subsequent cells left" bug:
+    blank columns produce empty cells in the correct slot instead of being
+    silently dropped.
+    """
+    if not ranges:
+        return []
+    buckets: List[List[OCRWord]] = [[] for _ in ranges]
+    for w in sorted(row.words, key=lambda z: z.x):
+        x_mid = w.x + w.w // 2
+        placed = False
+        for i, (lo, hi) in enumerate(ranges):
+            if lo <= x_mid < hi:
+                buckets[i].append(w)
+                placed = True
+                break
+        if not placed:
+            # Outside every range (extremely rare given sentinel bounds).
+            # Snap to the nearest column edge.
+            distances = [
+                min(abs(x_mid - lo), abs(x_mid - hi)) for lo, hi in ranges
+            ]
+            buckets[distances.index(min(distances))].append(w)
+    return [
+        normalize_cell(" ".join(w.text for w in bucket).strip())
+        for bucket in buckets
+    ]
+
+
 def fix_header_tol(headers: List[str]) -> List[str]:
     """If headers contain '+TOL' and bare 'TOL' (not '-TOL'), fix the bare one."""
     has_plus = any(h.strip() == "+TOL" for h in headers)
@@ -795,8 +872,13 @@ def rows_to_markdown(
                 md.append(f"### {h}")
             pending_headings = []
 
-            headers = split_row_by_gaps(clean_rows[i], gap)
+            header_row = clean_rows[i]
+            headers = split_row_by_gaps(header_row, gap)
             headers = fix_header_tol(headers)
+            # Column ranges derived from the header row so data-row words
+            # snap to their actual column, preserving empty cells in the
+            # right slot instead of left-shifting everything.
+            column_ranges = _column_ranges_from_header(header_row, gap)
             table_data: List[List[str]] = []
             i += 1
 
@@ -815,7 +897,11 @@ def rows_to_markdown(
                 if is_fcf_label(next_text):
                     break
                 if looks_like_data_row(next_text):
-                    table_data.append(split_row_by_gaps(clean_rows[i], gap))
+                    if column_ranges:
+                        cells = split_row_by_columns(clean_rows[i], column_ranges)
+                    else:
+                        cells = split_row_by_gaps(clean_rows[i], gap)
+                    table_data.append(cells)
                     i += 1
                 else:
                     break
