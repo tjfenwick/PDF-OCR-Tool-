@@ -56,8 +56,20 @@ sys.path.insert(0, str(BUNDLE_DIR))
 
 import OCR_PDF_to_Markdown as ocr_engine  # noqa: E402
 import fitz  # PyMuPDF                       noqa: E402
-import pytesseract  # noqa: E402
 from PIL import Image  # noqa: E402
+
+try:
+    import pytesseract  # noqa: E402
+except Exception:
+    pytesseract = None  # type: ignore[assignment]
+
+from ocr_backends import (  # noqa: E402
+    BACKEND_LABELS,
+    BACKEND_NAMES,
+    BackendMode,
+    backend_opts_from_args,
+    get_backend,
+)
 
 APP_TITLE = "PDF OCR Tool"
 APP_VERSION = "1.0.0"
@@ -116,6 +128,8 @@ def find_tesseract() -> Optional[Path]:
 
 
 def tesseract_works(path: Optional[str]) -> Tuple[bool, str]:
+    if pytesseract is None:
+        return (False, "pytesseract is not installed.")
     cmd = path or pytesseract.pytesseract.tesseract_cmd
     if not cmd:
         return (False, "No path configured.")
@@ -143,6 +157,14 @@ class OcrSettings:
     output_formats: List[str] = field(default_factory=lambda: ["markdown"])
     output_mode: str = "per_file"          # or "combined"
     combined_basename: str = "ocr_output"
+
+    # Backend selection + per-backend config
+    backend: str = "tesseract"
+    paddle_use_gpu: bool = False
+    qwen_base_url: str = "http://localhost:1234/v1"
+    qwen_api_key: str = "lm-studio"
+    qwen_model: str = ""
+    marker_workers: int = 1
 
     tesseract_path: str = ""
     lang: str = "eng"
@@ -175,39 +197,86 @@ class OcrSettings:
     show_notification: bool = True
 
 
-PRESETS: Dict[str, Dict[str, Any]] = {
-    "Default": {},
-    "Fast (lower quality)": {
-        "render_scale": 3.0,
-        "sharpen": 0,
-        "threshold": "global",
-        "dilate": 0,
+# Per-backend preset table. Keyed by (backend_name, preset_label).
+# When the backend dropdown changes, the GUI snaps the preset selection to
+# that backend's "Default" so stale knobs from another backend don't carry
+# over (e.g. Tesseract's PSM=6 has no meaning for Marker).
+PRESETS_BY_BACKEND: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "tesseract": {
+        "Default": {},
+        "Fast (lower quality)": {
+            "render_scale": 3.0,
+            "sharpen": 0,
+            "threshold": "global",
+            "dilate": 0,
+        },
+        "High quality": {
+            "render_scale": 6.0,
+            "contrast": 1.6,
+            "sharpen": 2,
+            "threshold": "adaptive",
+            "dilate": 1,
+        },
+        "Plain document (no tables)": {
+            "render_scale": 4.0,
+            "psm": 3,
+            "col_gap": 999,
+            "noise_alpha_ratio": 0.2,
+        },
+        "CMM report tables": {
+            "render_scale": 5.0,
+            "psm": 6,
+            "contrast": 1.4,
+            "sharpen": 1,
+            "threshold": "adaptive",
+            "dilate": 1,
+            "row_tol": 12,
+            "col_gap": 22,
+            "noise_conf": 55.0,
+        },
     },
-    "High quality": {
-        "render_scale": 6.0,
-        "contrast": 1.6,
-        "sharpen": 2,
-        "threshold": "adaptive",
-        "dilate": 1,
+    "paddleocr": {
+        # PaddleOCR's confidence is rescaled 0-1 → 0-100, but it tends to
+        # produce higher per-word confidences than Tesseract, so we can
+        # afford a tighter min-conf cutoff. No preprocessing is needed —
+        # PaddleOCR has its own detection model.
+        "Default": {
+            "render_scale": 3.0,
+            "contrast": 1.0,
+            "sharpen": 0,
+            "threshold": "none",
+            "dilate": 0,
+            "erode": 0,
+            "min_conf": 50.0,
+            "noise_conf": 60.0,
+        },
+        "CMM report tables": {
+            "render_scale": 4.0,
+            "contrast": 1.0,
+            "sharpen": 0,
+            "threshold": "none",
+            "dilate": 0,
+            "min_conf": 50.0,
+            "noise_conf": 60.0,
+            "row_tol": 12,
+            "col_gap": 22,
+        },
     },
-    "Plain document (no tables)": {
-        "render_scale": 4.0,
-        "psm": 3,
-        "col_gap": 999,
-        "noise_alpha_ratio": 0.2,
+    "marker": {
+        # Marker does its own page handling and ignores preprocessing.
+        "Default": {},
     },
-    "CMM report tables": {
-        "render_scale": 5.0,
-        "psm": 6,
-        "contrast": 1.4,
-        "sharpen": 1,
-        "threshold": "adaptive",
-        "dilate": 1,
-        "row_tol": 12,
-        "col_gap": 22,
-        "noise_conf": 55.0,
+    "qwen3vl": {
+        # Qwen3-VL gets the raw rendered image. Higher render scale = more
+        # legible images for the VLM but more tokens per page.
+        "Default": {
+            "render_scale": 3.0,
+        },
     },
 }
+
+# Backwards-compatible alias used by the existing preset-load/save code.
+PRESETS: Dict[str, Dict[str, Any]] = PRESETS_BY_BACKEND["tesseract"]
 
 
 def settings_to_args(s: OcrSettings) -> argparse.Namespace:
@@ -216,6 +285,12 @@ def settings_to_args(s: OcrSettings) -> argparse.Namespace:
         pdfs=s.inputs,
         output="",
         pages=s.pages or None,
+        ocr_backend=s.backend or "tesseract",
+        paddle_use_gpu=s.paddle_use_gpu,
+        marker_workers=s.marker_workers,
+        qwen_base_url=s.qwen_base_url or "http://localhost:1234/v1",
+        qwen_api_key=s.qwen_api_key or "lm-studio",
+        qwen_model=s.qwen_model or "",
         render_scale=s.render_scale,
         lang=s.lang,
         psm=s.psm,
@@ -409,8 +484,17 @@ def process_pdf_multi(
     cancel_event: threading.Event,
 ) -> Dict[str, Any]:
     args = settings_to_args(settings)
-    if args.tesseract_path:
+    if args.tesseract_path and pytesseract is not None:
         pytesseract.pytesseract.tesseract_cmd = args.tesseract_path
+
+    backend = get_backend(args.ocr_backend)
+    ok, msg = backend.available()
+    if not ok:
+        raise RuntimeError(
+            f"OCR backend '{backend.name}' is not available: {msg}"
+        )
+    opts = backend_opts_from_args(args)
+    word_level = backend.mode == BackendMode.WORD_LEVEL
 
     doc = fitz.open(pdf_path)
     try:
@@ -420,9 +504,20 @@ def process_pdf_multi(
         crop = ocr_engine.parse_crop(args.crop)
         formats = set(settings.output_formats)
 
+        # Document/page-level backends can't produce per-word boxes — silently
+        # drop the formats that need them and warn.
+        if not word_level:
+            dropped = [f for f in ("json", "csv", "searchable_pdf") if f in formats]
+            for f in dropped:
+                formats.discard(f)
+            if dropped:
+                log(f"  [info] {backend.name} doesn't produce word boxes — "
+                    f"skipping output format(s): {', '.join(dropped)}")
+
         md_chunks: List[str] = [f"# OCR Output: {pdf_path.name}\n"]
         md_chunks.append(
             "<!-- Settings: "
+            f"backend={backend.name}, "
             f"render_scale={args.render_scale}, psm={args.psm}, oem={args.oem}, "
             f"threshold={args.threshold}, threshold_value={args.threshold_value}, "
             f"contrast={args.contrast}, sharpen={args.sharpen}, "
@@ -437,6 +532,7 @@ def process_pdf_multi(
         json_doc: Dict[str, Any] = {
             "file": pdf_path.name,
             "total_pages": len(doc),
+            "backend": backend.name,
             "settings": {
                 k: v for k, v in vars(args).items() if k not in {"pdfs", "output"}
             },
@@ -449,6 +545,15 @@ def process_pdf_multi(
         if debug_dir:
             debug_dir.mkdir(parents=True, exist_ok=True)
 
+        # Document-level backends (Marker) emit the whole doc at once; cache
+        # the result so the per-page loop just appends each chunk.
+        doc_md_cache: Optional[Dict[int, str]] = None
+        if backend.mode == BackendMode.DOCUMENT_LEVEL:
+            log(f"  running {backend.name} on the full PDF...")
+            doc_md_cache = backend.ocr_document_markdown(
+                pdf_path, page_indices, opts
+            )
+
         total = len(page_indices)
         for idx, page_index in enumerate(page_indices):
             if cancel_event.is_set():
@@ -460,95 +565,113 @@ def process_pdf_multi(
             page = doc[page_index]
             rendered = ocr_engine.render_page(page, args.render_scale)
             rendered = ocr_engine.crop_image(rendered, crop)
-            processed = ocr_engine.preprocess_image(
-                rendered,
-                grayscale=not args.no_grayscale,
-                contrast=args.contrast,
-                sharpen=args.sharpen,
-                threshold=args.threshold,
-                threshold_value=args.threshold_value,
-                invert=args.invert,
-                dilate=args.dilate,
-                erode=args.erode,
-            )
-
             stem = f"{pdf_path.stem}_p{page_index + 1:02d}"
-            if debug_dir:
-                rendered.save(debug_dir / f"{stem}_rendered.png")
-                processed.save(debug_dir / f"{stem}_processed.png")
 
-            words = ocr_engine.tesseract_words(
-                processed, args.lang, args.psm, args.oem, args.min_conf
-            )
-
-            # Searchable PDF: bake OCR text layer onto the original rendered image
-            if "searchable_pdf" in formats:
-                try:
-                    pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-                        rendered, lang=args.lang,
-                        config=f"--oem {args.oem} --psm {args.psm}",
-                        extension="pdf",
-                    )
-                    pdf_page_bytes.append(pdf_bytes)
-                except Exception as exc:
-                    log(f"    [warn] searchable PDF page failed: {exc}")
-
-            # Per-page CSV records
-            if "csv" in formats:
-                for w in words:
-                    csv_records.append(
-                        [page_index + 1, w.x, w.y, w.w, w.h, round(w.conf, 2), w.text]
-                    )
-
-            # Per-page JSON records
-            if "json" in formats:
-                json_doc["pages"].append({
-                    "page": page_index + 1,
-                    "words": [
-                        {
-                            "text": w.text, "conf": round(w.conf, 2),
-                            "x": w.x, "y": w.y, "w": w.w, "h": w.h,
-                        }
-                        for w in words
-                    ],
-                })
-
-            # Drawing page short-circuit
-            if ocr_engine.detect_drawing_page(words):
-                md_chunks.append(f"\n## Page {page_index + 1}\n")
-                md_chunks.append(
-                    "*This page appears to be a drawing/graphic with no "
-                    "extractable table data.*\n"
+            if word_level:
+                processed = ocr_engine.preprocess_image(
+                    rendered,
+                    grayscale=not args.no_grayscale,
+                    contrast=args.contrast,
+                    sharpen=args.sharpen,
+                    threshold=args.threshold,
+                    threshold_value=args.threshold_value,
+                    invert=args.invert,
+                    dilate=args.dilate,
+                    erode=args.erode,
                 )
+                if debug_dir:
+                    rendered.save(debug_dir / f"{stem}_rendered.png")
+                    processed.save(debug_dir / f"{stem}_processed.png")
+
+                words = backend.ocr_page_words(processed, opts)
+
+                # Searchable PDF: only available with Tesseract (uses its hOCR output).
+                if "searchable_pdf" in formats and backend.name == "tesseract" and pytesseract is not None:
+                    try:
+                        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                            rendered, lang=args.lang,
+                            config=f"--oem {args.oem} --psm {args.psm}",
+                            extension="pdf",
+                        )
+                        pdf_page_bytes.append(pdf_bytes)
+                    except Exception as exc:
+                        log(f"    [warn] searchable PDF page failed: {exc}")
+
+                if "csv" in formats:
+                    for w in words:
+                        csv_records.append(
+                            [page_index + 1, w.x, w.y, w.w, w.h, round(w.conf, 2), w.text]
+                        )
+
+                if "json" in formats:
+                    json_doc["pages"].append({
+                        "page": page_index + 1,
+                        "words": [
+                            {
+                                "text": w.text, "conf": round(w.conf, 2),
+                                "x": w.x, "y": w.y, "w": w.w, "h": w.h,
+                            }
+                            for w in words
+                        ],
+                    })
+
+                if ocr_engine.detect_drawing_page(words):
+                    md_chunks.append(f"\n## Page {page_index + 1}\n")
+                    md_chunks.append(
+                        "*This page appears to be a drawing/graphic with no "
+                        "extractable table data.*\n"
+                    )
+                    if debug_dir:
+                        ocr_engine.save_confidence_csv(
+                            debug_dir / f"{stem}_confidence.csv", words
+                        )
+                    continue
+
+                rows = ocr_engine.group_words_into_rows(words, y_tolerance=args.row_tol)
+                page_md = ocr_engine.rows_to_markdown(
+                    rows,
+                    gap=args.col_gap,
+                    noise_conf=args.noise_conf,
+                    noise_alpha_ratio=args.noise_alpha_ratio,
+                    include_confidence_comments=args.confidence_comments,
+                )
+                md_chunks.append(f"\n## Page {page_index + 1}\n")
+                md_chunks.append(page_md)
+
+                if args.save_raw and debug_dir and backend.name == "tesseract" and pytesseract is not None:
+                    raw_text = pytesseract.image_to_string(
+                        processed, lang=args.lang,
+                        config=f"--oem {args.oem} --psm {args.psm} "
+                               "-c preserve_interword_spaces=1",
+                    )
+                    (debug_dir / f"{stem}_raw.txt").write_text(raw_text, encoding="utf-8")
+
                 if debug_dir:
                     ocr_engine.save_confidence_csv(
                         debug_dir / f"{stem}_confidence.csv", words
                     )
-                continue
 
-            rows = ocr_engine.group_words_into_rows(words, y_tolerance=args.row_tol)
-            page_md = ocr_engine.rows_to_markdown(
-                rows,
-                gap=args.col_gap,
-                noise_conf=args.noise_conf,
-                noise_alpha_ratio=args.noise_alpha_ratio,
-                include_confidence_comments=args.confidence_comments,
-            )
-            md_chunks.append(f"\n## Page {page_index + 1}\n")
-            md_chunks.append(page_md)
+            else:
+                # Page-level (Qwen) or document-level (Marker): markdown is
+                # produced verbatim, no row clustering, no CMM normalization.
+                if backend.mode == BackendMode.DOCUMENT_LEVEL:
+                    page_md = (doc_md_cache or {}).get(page_index, "")
+                else:
+                    page_md = backend.ocr_page_markdown(rendered, opts)
 
-            if args.save_raw and debug_dir:
-                raw_text = pytesseract.image_to_string(
-                    processed, lang=args.lang,
-                    config=f"--oem {args.oem} --psm {args.psm} "
-                           "-c preserve_interword_spaces=1",
-                )
-                (debug_dir / f"{stem}_raw.txt").write_text(raw_text, encoding="utf-8")
+                if debug_dir:
+                    rendered.save(debug_dir / f"{stem}_rendered.png")
 
-            if debug_dir:
-                ocr_engine.save_confidence_csv(
-                    debug_dir / f"{stem}_confidence.csv", words
-                )
+                if not page_md.strip():
+                    md_chunks.append(f"\n## Page {page_index + 1}\n")
+                    md_chunks.append(
+                        "*This page appears to be a drawing/graphic with no "
+                        "extractable table data.*\n"
+                    )
+                    continue
+
+                md_chunks.append(f"\n## Page {page_index + 1}\n")
+                md_chunks.append(page_md)
 
         progress(total, total)
 
@@ -769,6 +892,63 @@ class OcrApp(tk.Tk):
     def _build_ocr_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
+        # Backend dropdown — drives which rows below are visible.
+        ttk.Label(parent, text="OCR Backend:").grid(row=0, column=0, sticky="w")
+        self._backend_var = tk.StringVar(value="tesseract")
+        backend_box = ttk.Combobox(
+            parent, textvariable=self._backend_var,
+            values=[BACKEND_LABELS[n] for n in BACKEND_NAMES],
+            state="readonly",
+        )
+        backend_box.set(BACKEND_LABELS["tesseract"])
+        backend_box.grid(row=0, column=1, sticky="ew", padx=4)
+        backend_box.bind("<<ComboboxSelected>>", self._on_backend_changed)
+        ttk.Label(parent, text="Select OCR engine").grid(row=0, column=2, sticky="w")
+
+        # Per-backend group frames. Only the active backend's frame is gridded.
+        self._tess_frame = ttk.Frame(parent)
+        self._paddle_frame = ttk.Frame(parent)
+        self._marker_frame = ttk.Frame(parent)
+        self._qwen_frame = ttk.Frame(parent)
+        for f in (self._tess_frame, self._paddle_frame,
+                  self._marker_frame, self._qwen_frame):
+            f.columnconfigure(1, weight=1)
+
+        self._build_tesseract_group(self._tess_frame)
+        self._build_paddle_group(self._paddle_frame)
+        self._build_marker_group(self._marker_frame)
+        self._build_qwen_group(self._qwen_frame)
+
+        # Preset row — shared across backends but its value list is rebuilt
+        # when the backend changes.
+        ttk.Label(parent, text="Preset:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._preset_var = tk.StringVar(value="Default")
+        self._preset_box = ttk.Combobox(
+            parent, textvariable=self._preset_var,
+            values=list(PRESETS_BY_BACKEND["tesseract"].keys()),
+            state="readonly",
+        )
+        self._preset_box.grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
+        self._preset_box.bind("<<ComboboxSelected>>", self._on_apply_builtin_preset)
+        ttk.Label(parent, text="Built-in starting points").grid(row=1, column=2, sticky="w", pady=(8, 0))
+
+        # Page range — shared across all backends.
+        ttk.Label(parent, text="Pages:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._pages_var = tk.StringVar(value="")
+        ttk.Entry(parent, textvariable=self._pages_var).grid(
+            row=2, column=1, sticky="ew", padx=4, pady=(4, 0)
+        )
+        ttk.Label(parent, text="e.g. 1,2,4-5 (blank = all)").grid(
+            row=2, column=2, sticky="w", pady=(4, 0)
+        )
+
+        # Backend-specific frame goes in row 3 spanning all columns.
+        self._backend_frame_row = 3
+
+        # Apply initial backend visibility.
+        self._apply_backend_visibility()
+
+    def _build_tesseract_group(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Tesseract executable:").grid(row=0, column=0, sticky="w")
         self._tess_var = tk.StringVar()
         ttk.Entry(parent, textvariable=self._tess_var).grid(row=0, column=1, sticky="ew", padx=4)
@@ -783,56 +963,227 @@ class OcrApp(tk.Tk):
         ttk.Entry(parent, textvariable=self._lang_var).grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
         ttk.Label(parent, text='e.g. "eng" or "eng+deu"').grid(row=1, column=2, sticky="w", pady=(8, 0))
 
-        ttk.Label(parent, text="Preset:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self._preset_var = tk.StringVar(value="Default")
-        preset_box = ttk.Combobox(parent, textvariable=self._preset_var,
-                                  values=list(PRESETS.keys()), state="readonly")
-        preset_box.grid(row=2, column=1, sticky="ew", padx=4, pady=(8, 0))
-        preset_box.bind("<<ComboboxSelected>>", self._on_apply_builtin_preset)
-        ttk.Label(parent, text="Built-in starting points").grid(row=2, column=2, sticky="w", pady=(8, 0))
-
-        ttk.Label(parent, text="Page segmentation (PSM):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(parent, text="Page segmentation (PSM):").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self._psm_var = tk.IntVar(value=6)
         ttk.Combobox(parent, textvariable=self._psm_var,
                      values=[3, 4, 6, 11, 12], state="readonly", width=6).grid(
-            row=3, column=1, sticky="w", padx=4, pady=(8, 0)
+            row=2, column=1, sticky="w", padx=4, pady=(8, 0)
         )
         ttk.Label(parent, text="6=block, 4=column, 3=auto, 11/12=sparse").grid(
-            row=3, column=2, sticky="w", pady=(8, 0)
+            row=2, column=2, sticky="w", pady=(8, 0)
         )
 
-        ttk.Label(parent, text="OCR engine (OEM):").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="OCR engine (OEM):").grid(row=3, column=0, sticky="w", pady=(4, 0))
         self._oem_var = tk.IntVar(value=3)
         ttk.Combobox(parent, textvariable=self._oem_var,
                      values=[0, 1, 2, 3], state="readonly", width=6).grid(
-            row=4, column=1, sticky="w", padx=4, pady=(4, 0)
+            row=3, column=1, sticky="w", padx=4, pady=(4, 0)
         )
-        ttk.Label(parent, text="3=default LSTM").grid(row=4, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="3=default LSTM").grid(row=3, column=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(parent, text="Render scale:").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="Render scale:").grid(row=4, column=0, sticky="w", pady=(4, 0))
         self._render_var = tk.DoubleVar(value=5.0)
         ttk.Spinbox(parent, from_=1.0, to=10.0, increment=0.5,
                     textvariable=self._render_var, width=8).grid(
-            row=5, column=1, sticky="w", padx=4, pady=(4, 0)
+            row=4, column=1, sticky="w", padx=4, pady=(4, 0)
         )
-        ttk.Label(parent, text="3-6 for small text").grid(row=5, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="3-6 for small text").grid(row=4, column=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(parent, text="Min word confidence:").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="Min word confidence:").grid(row=5, column=0, sticky="w", pady=(4, 0))
         self._min_conf_var = tk.DoubleVar(value=20.0)
         ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
                     textvariable=self._min_conf_var, width=8).grid(
-            row=6, column=1, sticky="w", padx=4, pady=(4, 0)
+            row=5, column=1, sticky="w", padx=4, pady=(4, 0)
         )
-        ttk.Label(parent, text="0-100").grid(row=6, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(parent, text="0-100").grid(row=5, column=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(parent, text="Pages:").grid(row=7, column=0, sticky="w", pady=(4, 0))
-        self._pages_var = tk.StringVar(value="")
-        ttk.Entry(parent, textvariable=self._pages_var).grid(
-            row=7, column=1, sticky="ew", padx=4, pady=(4, 0)
+    def _build_paddle_group(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="PaddleOCR runs detection + recognition with its own models.\n"
+                 "Tesseract-style PSM/OEM are not used.",
+            justify="left", foreground="#555",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(parent, text="Language:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(parent, textvariable=self._safe_var("_lang_var", "eng")).grid(
+            row=1, column=1, sticky="ew", padx=4
         )
-        ttk.Label(parent, text="e.g. 1,2,4-5 (blank = all)").grid(
-            row=7, column=2, sticky="w", pady=(4, 0)
+        ttk.Label(parent, text='eng, fra, ger, chi_sim, ...').grid(row=1, column=2, sticky="w")
+
+        ttk.Label(parent, text="Render scale:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Spinbox(parent, from_=1.0, to=10.0, increment=0.5,
+                    textvariable=self._safe_var("_render_var", 3.0, kind="double"),
+                    width=8).grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="3 is usually enough for Paddle").grid(
+            row=2, column=2, sticky="w", pady=(6, 0)
         )
+
+        ttk.Label(parent, text="Min word confidence:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Spinbox(parent, from_=0.0, to=100.0, increment=1,
+                    textvariable=self._safe_var("_min_conf_var", 50.0, kind="double"),
+                    width=8).grid(row=3, column=1, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(parent, text="0-100 (Paddle: try ~50)").grid(row=3, column=2, sticky="w", pady=(4, 0))
+
+        self._paddle_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(parent, text="Use GPU (requires paddlepaddle-gpu)",
+                        variable=self._paddle_gpu_var).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0)
+        )
+
+    def _build_marker_group(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Datalab Marker reads the PDF directly and produces clean\n"
+                 "markdown for LLMs. Preprocessing knobs do not apply.\n"
+                 "First run downloads ~2 GB of models (cached after that).",
+            justify="left", foreground="#555",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(parent, text="Workers:").grid(row=1, column=0, sticky="w")
+        self._marker_workers_var = tk.IntVar(value=1)
+        ttk.Spinbox(parent, from_=1, to=8, increment=1,
+                    textvariable=self._marker_workers_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=4
+        )
+        ttk.Label(parent, text="Parallel page workers").grid(row=1, column=2, sticky="w")
+
+    def _build_qwen_group(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Qwen3-VL via LM Studio. Start LM Studio, load a vision model,\n"
+                 "and click 'Refresh models' to populate the dropdown.",
+            justify="left", foreground="#555",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(parent, text="Base URL:").grid(row=1, column=0, sticky="w")
+        self._qwen_url_var = tk.StringVar(value="http://localhost:1234/v1")
+        ttk.Entry(parent, textvariable=self._qwen_url_var).grid(
+            row=1, column=1, sticky="ew", padx=4
+        )
+        ttk.Label(parent, text="LM Studio default port").grid(row=1, column=2, sticky="w")
+
+        ttk.Label(parent, text="API key:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._qwen_key_var = tk.StringVar(value="lm-studio")
+        ttk.Entry(parent, textvariable=self._qwen_key_var, show="*").grid(
+            row=2, column=1, sticky="ew", padx=4, pady=(4, 0)
+        )
+        ttk.Label(parent, text="LM Studio: anything works").grid(row=2, column=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(parent, text="Model:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self._qwen_model_var = tk.StringVar(value="")
+        self._qwen_model_box = ttk.Combobox(
+            parent, textvariable=self._qwen_model_var, values=[], state="normal",
+        )
+        self._qwen_model_box.grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 0))
+        qwen_btn_row = ttk.Frame(parent)
+        qwen_btn_row.grid(row=3, column=2, sticky="w", pady=(4, 0))
+        ttk.Button(qwen_btn_row, text="Refresh models",
+                   command=self._refresh_qwen_models).pack(side="left")
+        ttk.Button(qwen_btn_row, text="Test connection",
+                   command=self._test_qwen_connection).pack(side="left", padx=(4, 0))
+
+        ttk.Label(parent, text="Render scale:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Spinbox(parent, from_=1.0, to=10.0, increment=0.5,
+                    textvariable=self._safe_var("_render_var", 3.0, kind="double"),
+                    width=8).grid(row=4, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(parent, text="Higher = more legible but more tokens").grid(
+            row=4, column=2, sticky="w", pady=(6, 0)
+        )
+
+    def _safe_var(self, attr: str, default, kind: str = "string"):
+        """Return the existing tk var on the app instance, creating it if
+        it doesn't exist yet. Lets multiple backend groups share the same
+        underlying variable (e.g. render_scale, lang, min_conf)."""
+        if hasattr(self, attr):
+            return getattr(self, attr)
+        if kind == "double":
+            var = tk.DoubleVar(value=default)
+        elif kind == "int":
+            var = tk.IntVar(value=default)
+        elif kind == "bool":
+            var = tk.BooleanVar(value=bool(default))
+        else:
+            var = tk.StringVar(value=default)
+        setattr(self, attr, var)
+        return var
+
+    def _label_to_backend(self, label: str) -> str:
+        for name in BACKEND_NAMES:
+            if BACKEND_LABELS[name] == label:
+                return name
+        return label  # if already a raw name
+
+    def _backend_to_label(self, name: str) -> str:
+        return BACKEND_LABELS.get(name, name)
+
+    def _apply_backend_visibility(self) -> None:
+        """Show only the active backend's group frame and refresh the preset list."""
+        active = self._label_to_backend(self._backend_var.get())
+        frames = {
+            "tesseract": self._tess_frame,
+            "paddleocr": self._paddle_frame,
+            "marker":    self._marker_frame,
+            "qwen3vl":   self._qwen_frame,
+        }
+        for name, frame in frames.items():
+            if name == active:
+                frame.grid(row=self._backend_frame_row, column=0, columnspan=3,
+                           sticky="ew", pady=(8, 0))
+            else:
+                frame.grid_forget()
+
+        # Refresh preset dropdown for this backend.
+        presets = list(PRESETS_BY_BACKEND.get(active, {"Default": {}}).keys())
+        self._preset_box.configure(values=presets)
+        if self._preset_var.get() not in presets:
+            self._preset_var.set(presets[0] if presets else "Default")
+
+    def _on_backend_changed(self, _event: Any) -> None:
+        active = self._label_to_backend(self._backend_var.get())
+        self._apply_backend_visibility()
+        # Snap to that backend's "Default" preset so stale knobs don't carry
+        # over from the previously selected backend.
+        presets = PRESETS_BY_BACKEND.get(active, {})
+        if "Default" in presets:
+            self._preset_var.set("Default")
+            self._apply_preset_overrides(active, "Default")
+        self._log(f"Switched OCR backend to: {active}")
+
+    def _apply_preset_overrides(self, backend: str, preset_name: str) -> None:
+        overrides = PRESETS_BY_BACKEND.get(backend, {}).get(preset_name, {})
+        if not overrides:
+            return
+        base = OcrSettings()
+        for k, v in overrides.items():
+            setattr(base, k, v)
+        self._apply_settings(base, only_processing=True)
+        self._log(f"Applied preset: {backend} / {preset_name}")
+
+    def _refresh_qwen_models(self) -> None:
+        backend = get_backend("qwen3vl")
+        models = backend.list_models(
+            self._qwen_url_var.get().strip(),
+            self._qwen_key_var.get().strip(),
+        )
+        self._qwen_model_box.configure(values=models)
+        if models:
+            if not self._qwen_model_var.get() or self._qwen_model_var.get() not in models:
+                self._qwen_model_var.set(models[0])
+            self._log(f"Found {len(models)} model(s) at {self._qwen_url_var.get()}")
+        else:
+            self._log(f"No models returned by {self._qwen_url_var.get()} — is LM Studio running?")
+
+    def _test_qwen_connection(self) -> None:
+        backend = get_backend("qwen3vl")
+        ok, msg = backend.test_connection(
+            self._qwen_url_var.get().strip(),
+            self._qwen_key_var.get().strip(),
+        )
+        if ok:
+            messagebox.showinfo("LM Studio connection", msg)
+        else:
+            messagebox.showerror("LM Studio connection failed", msg)
 
     # ---- "Preprocessing" tab ----
     def _build_prep_tab(self, parent: ttk.Frame) -> None:
@@ -1013,16 +1364,9 @@ class OcrApp(tk.Tk):
 
     # ---- presets ----
     def _on_apply_builtin_preset(self, _event: Any) -> None:
+        backend = self._label_to_backend(self._backend_var.get())
         name = self._preset_var.get()
-        overrides = PRESETS.get(name, {})
-        if not overrides:
-            return
-        base = OcrSettings()
-        for k, v in overrides.items():
-            setattr(base, k, v)
-        # only apply OCR/preprocessing/layout fields, leave file lists alone
-        self._apply_settings(base, only_processing=True)
-        self._log(f"Applied built-in preset: {name}")
+        self._apply_preset_overrides(backend, name)
 
     def _save_preset(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1115,6 +1459,13 @@ class OcrApp(tk.Tk):
             output_mode=self._mode_var.get(),
             combined_basename=self._combined_name_var.get().strip() or "ocr_output",
 
+            backend=self._label_to_backend(self._backend_var.get()),
+            paddle_use_gpu=bool(self._paddle_gpu_var.get()),
+            qwen_base_url=self._qwen_url_var.get().strip() or "http://localhost:1234/v1",
+            qwen_api_key=self._qwen_key_var.get().strip() or "lm-studio",
+            qwen_model=self._qwen_model_var.get().strip(),
+            marker_workers=int(self._marker_workers_var.get()),
+
             tesseract_path=self._tess_var.get().strip(),
             lang=self._lang_var.get().strip() or "eng",
             psm=int(self._psm_var.get()),
@@ -1160,6 +1511,15 @@ class OcrApp(tk.Tk):
             self._debug_dir_var.set(s.debug_dir)
             self._open_when_done_var.set(s.open_when_done)
             self._show_notify_var.set(s.show_notification)
+
+            backend_name = s.backend or "tesseract"
+            self._backend_var.set(self._backend_to_label(backend_name))
+            self._paddle_gpu_var.set(bool(s.paddle_use_gpu))
+            self._qwen_url_var.set(s.qwen_base_url or "http://localhost:1234/v1")
+            self._qwen_key_var.set(s.qwen_api_key or "lm-studio")
+            self._qwen_model_var.set(s.qwen_model or "")
+            self._marker_workers_var.set(int(s.marker_workers or 1))
+            self._apply_backend_visibility()
 
         self._lang_var.set(s.lang)
         self._psm_var.set(s.psm)
@@ -1301,14 +1661,28 @@ class OcrApp(tk.Tk):
         for f in s.inputs:
             if not Path(f).exists():
                 return f"Missing input file: {f}"
-        ok, msg = tesseract_works(s.tesseract_path or None)
-        if not ok:
-            return (
-                "Tesseract OCR is not available.\n\n"
-                f"{msg}\n\n"
-                "Install it from https://github.com/UB-Mannheim/tesseract/wiki "
-                "and point the OCR tab to tesseract.exe."
-            )
+
+        backend_name = s.backend or "tesseract"
+        if backend_name == "tesseract":
+            ok, msg = tesseract_works(s.tesseract_path or None)
+            if not ok:
+                return (
+                    "Tesseract OCR is not available.\n\n"
+                    f"{msg}\n\n"
+                    "Install it from https://github.com/UB-Mannheim/tesseract/wiki "
+                    "and point the OCR tab to tesseract.exe."
+                )
+        else:
+            backend = get_backend(backend_name)
+            ok, msg = backend.available()
+            if not ok:
+                return f"OCR backend '{backend_name}' is not available.\n\n{msg}"
+            if backend_name == "qwen3vl" and not (s.qwen_model or "").strip():
+                return (
+                    "Qwen3-VL needs a model id.\n\n"
+                    "Load a vision model into LM Studio, then click "
+                    "'Refresh models' on the OCR tab and pick one."
+                )
         return None
 
     # ---- worker thread ----

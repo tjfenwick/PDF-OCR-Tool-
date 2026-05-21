@@ -45,7 +45,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -66,10 +66,10 @@ except Exception as exc:
 
 try:
     import pytesseract
-except Exception as exc:
-    raise SystemExit(
-        "Missing dependency: pytesseract. Install with:  pip install pytesseract"
-    ) from exc
+except Exception:
+    # pytesseract is only required when the Tesseract backend is actually used.
+    # Other backends (PaddleOCR, Marker, Qwen3-VL) do not need it.
+    pytesseract = None  # type: ignore[assignment]
 
 try:
     import cv2
@@ -79,12 +79,11 @@ except Exception:
     np = None
 
 # ---------------------------------------------------------------------------
-# Default Tesseract path -- update this to match YOUR install location.
-# Can also be overridden at runtime with  --tesseract-path
+# Tesseract path: defaults to whatever pytesseract auto-discovers on PATH.
+# Override per-invocation with  --tesseract-path  (CLI) or via the GUI's
+# Tesseract executable field. The portable .exe build also auto-detects a
+# bundled  tesseract/  folder next to the executable.
 # ---------------------------------------------------------------------------
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Users\30774508\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-)
 
 
 # ===================================================================
@@ -243,6 +242,10 @@ def tesseract_words(
     img: Image.Image, lang: str, psm: int, oem: int, min_conf: float
 ) -> List[OCRWord]:
     """Run Tesseract and return a list of OCRWord objects."""
+    if pytesseract is None:
+        raise SystemExit(
+            "pytesseract is not installed. Install with: pip install pytesseract"
+        )
     config = f"--oem {oem} --psm {psm} -c preserve_interword_spaces=1"
     data = pytesseract.image_to_data(
         img, lang=lang, config=config, output_type=pytesseract.Output.DICT
@@ -823,6 +826,18 @@ def save_confidence_csv(path: Path, words: List[OCRWord]) -> None:
 # ===================================================================
 def process_pdf(pdf_path: Path, args) -> str:
     """OCR a single PDF and return the Markdown string."""
+    from ocr_backends import (
+        BackendMode,
+        backend_opts_from_args,
+        get_backend,
+    )
+
+    backend = get_backend(getattr(args, "ocr_backend", "tesseract"))
+    ok, msg = backend.available()
+    if not ok:
+        raise SystemExit(f"Backend '{backend.name}' unavailable: {msg}")
+    opts = backend_opts_from_args(args)
+
     doc = fitz.open(pdf_path)
     pages = parse_pages(args.pages, len(doc))
     crop = parse_crop(args.crop)
@@ -831,6 +846,7 @@ def process_pdf(pdf_path: Path, args) -> str:
     chunks.append(f"# OCR Output: {pdf_path.name}\n")
     chunks.append(
         "<!-- Settings: "
+        f"backend={backend.name}, "
         f"render_scale={args.render_scale}, psm={args.psm}, oem={args.oem}, "
         f"threshold={args.threshold}, threshold_value={args.threshold_value}, "
         f"contrast={args.contrast}, sharpen={args.sharpen}, "
@@ -846,66 +862,95 @@ def process_pdf(pdf_path: Path, args) -> str:
     if debug_dir:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
+    # Document-level backends (Marker) generate finished markdown for the
+    # whole PDF in one shot; cache the result so the per-page loop just
+    # pastes each chunk under its heading.
+    doc_md_cache: Optional[Dict[int, str]] = None
+    if backend.mode == BackendMode.DOCUMENT_LEVEL:
+        doc_md_cache = backend.ocr_document_markdown(pdf_path, pages, opts)
+
     for page_index in pages:
         page = doc[page_index]
         rendered = render_page(page, args.render_scale)
         rendered = crop_image(rendered, crop)
-        processed = preprocess_image(
-            rendered,
-            grayscale=not args.no_grayscale,
-            contrast=args.contrast,
-            sharpen=args.sharpen,
-            threshold=args.threshold,
-            threshold_value=args.threshold_value,
-            invert=args.invert,
-            dilate=args.dilate,
-            erode=args.erode,
-        )
 
         stem = f"{pdf_path.stem}_p{page_index + 1:02d}"
 
-        if debug_dir:
-            rendered.save(debug_dir / f"{stem}_rendered.png")
-            processed.save(debug_dir / f"{stem}_processed.png")
-
-        words = tesseract_words(
-            processed, args.lang, args.psm, args.oem, args.min_conf
-        )
-
-        # Check for drawing-only pages
-        if detect_drawing_page(words):
-            chunks.append(f"\n## Page {page_index + 1}\n")
-            chunks.append(
-                "*This page appears to be a drawing/graphic with no "
-                "extractable table data.*\n"
+        # Word-level backends use the existing preprocessing + clustering
+        # pipeline. Page/document-level backends consume the rendered image
+        # (or the PDF directly) — preprocessing only hurts them.
+        if backend.mode == BackendMode.WORD_LEVEL:
+            processed = preprocess_image(
+                rendered,
+                grayscale=not args.no_grayscale,
+                contrast=args.contrast,
+                sharpen=args.sharpen,
+                threshold=args.threshold,
+                threshold_value=args.threshold_value,
+                invert=args.invert,
+                dilate=args.dilate,
+                erode=args.erode,
             )
+            if debug_dir:
+                rendered.save(debug_dir / f"{stem}_rendered.png")
+                processed.save(debug_dir / f"{stem}_processed.png")
+
+            words = backend.ocr_page_words(processed, opts)
+
+            if detect_drawing_page(words):
+                chunks.append(f"\n## Page {page_index + 1}\n")
+                chunks.append(
+                    "*This page appears to be a drawing/graphic with no "
+                    "extractable table data.*\n"
+                )
+                if debug_dir:
+                    save_confidence_csv(debug_dir / f"{stem}_confidence.csv", words)
+                continue
+
+            rows = group_words_into_rows(words, y_tolerance=args.row_tol)
+            page_md = rows_to_markdown(
+                rows,
+                gap=args.col_gap,
+                noise_conf=args.noise_conf,
+                noise_alpha_ratio=args.noise_alpha_ratio,
+                include_confidence_comments=args.confidence_comments,
+            )
+
+            if args.save_raw and pytesseract is not None and backend.name == "tesseract":
+                raw_text = pytesseract.image_to_string(
+                    processed,
+                    lang=args.lang,
+                    config=f"--oem {args.oem} --psm {args.psm} -c preserve_interword_spaces=1",
+                )
+                if debug_dir:
+                    (debug_dir / f"{stem}_raw.txt").write_text(raw_text, encoding="utf-8")
+
             if debug_dir:
                 save_confidence_csv(debug_dir / f"{stem}_confidence.csv", words)
-            continue
 
-        rows = group_words_into_rows(words, y_tolerance=args.row_tol)
-        page_md = rows_to_markdown(
-            rows,
-            gap=args.col_gap,
-            noise_conf=args.noise_conf,
-            noise_alpha_ratio=args.noise_alpha_ratio,
-            include_confidence_comments=args.confidence_comments,
-        )
+            chunks.append(f"\n## Page {page_index + 1}\n")
+            chunks.append(page_md)
 
-        if args.save_raw:
-            raw_text = pytesseract.image_to_string(
-                processed,
-                lang=args.lang,
-                config=f"--oem {args.oem} --psm {args.psm} -c preserve_interword_spaces=1",
-            )
+        else:
+            # Page-level (Qwen) or document-level (Marker) backend.
+            if backend.mode == BackendMode.DOCUMENT_LEVEL:
+                page_md = (doc_md_cache or {}).get(page_index, "") if doc_md_cache else ""
+            else:
+                page_md = backend.ocr_page_markdown(rendered, opts)
+
             if debug_dir:
-                (debug_dir / f"{stem}_raw.txt").write_text(raw_text, encoding="utf-8")
+                rendered.save(debug_dir / f"{stem}_rendered.png")
 
-        if debug_dir:
-            save_confidence_csv(debug_dir / f"{stem}_confidence.csv", words)
+            if not page_md.strip():
+                chunks.append(f"\n## Page {page_index + 1}\n")
+                chunks.append(
+                    "*This page appears to be a drawing/graphic with no "
+                    "extractable table data.*\n"
+                )
+                continue
 
-        chunks.append(f"\n## Page {page_index + 1}\n")
-        chunks.append(page_md)
+            chunks.append(f"\n## Page {page_index + 1}\n")
+            chunks.append(page_md)
 
     doc.close()
     return "\n".join(chunks).strip() + "\n"
@@ -931,6 +976,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pages",
         help="Pages to OCR, e.g. 1,2,4-5. Default: all pages.",
+    )
+
+    # -- Backend selection --
+    g = p.add_argument_group("OCR backend")
+    g.add_argument(
+        "--ocr-backend",
+        choices=["tesseract", "paddleocr", "marker", "qwen3vl"],
+        default="tesseract",
+        help=(
+            "OCR engine: tesseract (default), paddleocr (better dense text), "
+            "marker (PDF→markdown for LLMs), qwen3vl (local LM Studio VLM)."
+        ),
+    )
+    g.add_argument(
+        "--paddle-use-gpu", action="store_true",
+        help="PaddleOCR: use GPU if paddlepaddle-gpu is installed.",
+    )
+    g.add_argument(
+        "--marker-workers", type=int, default=1,
+        help="Marker: parallel workers (default: 1).",
+    )
+    g.add_argument(
+        "--qwen-base-url", default="http://localhost:1234/v1",
+        help="Qwen3-VL: OpenAI-compatible base URL (default: LM Studio).",
+    )
+    g.add_argument(
+        "--qwen-api-key", default=None,
+        help="Qwen3-VL: API key. Falls back to env QWEN_API_KEY, then 'lm-studio'.",
+    )
+    g.add_argument(
+        "--qwen-model", default="",
+        help="Qwen3-VL: model id loaded in LM Studio (required for qwen3vl).",
     )
 
     # -- Render / OCR --
@@ -1036,9 +1113,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    # Override Tesseract path if requested
-    if args.tesseract_path:
+    # Override Tesseract path if requested (only meaningful when Tesseract is the backend).
+    if args.tesseract_path and pytesseract is not None:
         pytesseract.pytesseract.tesseract_cmd = args.tesseract_path
+
+    # Qwen3-VL API key fallback: explicit flag → env var → "lm-studio" sentinel.
+    if args.qwen_api_key is None:
+        import os
+        args.qwen_api_key = (
+            os.environ.get("QWEN_API_KEY")
+            or os.environ.get("DASHSCOPE_API_KEY")
+            or "lm-studio"
+        )
 
     all_md: List[str] = []
     for pdf in args.pdfs:

@@ -1,0 +1,10 @@
+# Optional OCR backends. Install these when running from source if you want
+# anything besides Tesseract. The portable .exe build pulls these in via
+# requirements-build.txt so the bundled .exe ships every backend.
+#
+#   pip install -r requirements-backends.txt
+
+paddleocr>=2.7
+paddlepaddle>=2.6
+marker-pdf>=0.2
+openai>=1.30

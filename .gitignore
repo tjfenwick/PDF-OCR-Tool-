@@ -8,8 +8,14 @@ build/
 dist/
 *.spec.bak
 
+# Bundled OCR model caches — populated by prefetch_models.py during the
+# Windows .exe build. Multi-GB and rebuilt on every CI run.
 tesseract/
+paddleocr_models/
+marker_models/
 
 # settings file lives in user home, but if anyone places one in-tree
 .pdf_ocr_gui_config.json
+.env
+*.local.json
 *.zip
