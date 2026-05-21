@@ -8,9 +8,10 @@ for image preprocessing.
 
 ## Features
 
-- **Drag-free GUI** with five tabs: Files & Output, OCR, Preprocessing,
-  Layout & Noise, Diagnostics.
-- **Batch input** – add files, add a whole folder (recursive), reorder, remove.
+- **GUI with seven tabs** — Files & Output, OCR, Preprocessing, Layout &
+  Noise, Diagnostics, **Validation**, and **Watch folder**.
+- **Batch input** – add files, add a whole folder (recursive), recent
+  files/folders menu, reorder, remove.
 - **Multiple output formats per run**
   - Markdown (`.md`) – preserves headings and reconstructed tables
   - Plain text (`.txt`)
@@ -18,17 +19,39 @@ for image preprocessing.
   - CSV (`.csv`) – flat word-level data
   - HTML (`.html`) – self-contained, styled
   - Searchable PDF (`.pdf`) – original image with an OCR text layer
-- **One file per PDF** or **one combined file** per format.
+- **Multi-core processing** – Workers spinbox on the OCR tab. Tesseract is
+  capped to one OpenMP thread per call so page-level parallelism scales
+  linearly. ≥3× speed-up on 4 cores in our tests.
+- **PDF text-layer fast path** – PDFs exported from Word/Excel/etc. already
+  contain real text. The tool detects those pages and uses the embedded
+  text instead of OCR (instant + perfectly accurate). Toggle on the OCR tab.
+- **Best-accuracy mode** – runs each page with multiple Tesseract
+  segmentations and keeps the higher-confidence result.
+- **Image cleanup** – auto-deskew and denoise toggles on the Preprocessing
+  tab.
+- **Encrypted PDFs** – auto-prompts for password when needed.
+- **Validation dashboard** – after-run report with per-file metrics,
+  low-confidence pages, and a preview pane that highlights low-confidence
+  OCR words on the page image.
+- **Self-test** – Help → Run self-test verifies your install on a known
+  synthetic PDF.
+- **Audit log** – per-run `_audit.json` sidecar with settings snapshot,
+  source SHA-256, per-page metrics, Tesseract version, timestamp.
+- **Watch folder** – drop PDFs into a folder and have them processed
+  automatically using the current settings.
 - **OCR settings** – language, PSM, OEM, render scale, min-word confidence,
   page range (e.g. `1,2,4-5`).
-- **Preprocessing** – grayscale, contrast, sharpen, threshold (none / global /
-  adaptive), threshold value, invert, dilate/erode, crop.
+- **Preprocessing** – grayscale, contrast, sharpen, threshold (none / global
+  / adaptive), threshold value, invert, dilate/erode, crop, deskew, denoise.
 - **Layout & noise filtering** – row tolerance, column gap, row-noise
   confidence cutoff, min alphanumeric ratio.
 - **Diagnostics** – save rendered/processed PNGs, raw Tesseract text, per-row
-  confidence comments.
+  confidence comments, audit log toggle.
 - **Presets** – built-in (Default, Fast, High quality, Plain document, CMM
   tables) plus save/load custom presets as JSON.
+- **In-app help** – every field has a hover tooltip; Help → Settings
+  reference shows the same content grouped by tab; Help → Quick start
+  guide for a 5-step tour of the GUI.
 - **Auto-detects Tesseract** on PATH, common install paths, and a sibling
   `tesseract/` folder (used by the portable .exe build).
 - **Threaded processing** with a live log, per-page progress, and Cancel.
@@ -69,6 +92,34 @@ Every push to `main` and the feature branch triggers
 Download the zip from the **Actions** tab → latest run → **Artifacts**,
 unzip anywhere on Windows, and run `PDF-OCR-Tool.exe`. No admin and no
 separate Tesseract install required.
+
+### First run on Windows — getting past SmartScreen
+
+Because the .exe is downloaded from the internet and not signed with a
+purchased code-signing certificate, the first launch on a fresh machine
+shows **"Windows protected your PC"** (Microsoft Defender SmartScreen).
+None of the fixes below require admin:
+
+- **Recommended — unblock the zip *before* extracting.**
+  Right-click `PDF-OCR-Tool-windows-x64.zip` → **Properties** → tick
+  **Unblock** → **OK**. Then extract and run. This strips the
+  Mark-of-the-Web from every file inside, so SmartScreen never fires.
+- **Or, on the SmartScreen dialog:** click the small **More info** link,
+  then the **Run anyway** button that appears. Per-user choice, no admin.
+- **Or, in PowerShell** after extraction (no admin):
+  ```powershell
+  Get-ChildItem -Recurse "C:\path\to\PDF-OCR-Tool" | Unblock-File
+  ```
+
+The build embeds Windows version info, so the dialog identifies the file
+as **"PDF OCR Tool"** published by **tjfenwick** rather than "Unknown".
+
+To verify the download is intact, check the SHA-256 against the published
+`PDF-OCR-Tool-windows-x64.zip.sha256` file:
+
+```powershell
+Get-FileHash PDF-OCR-Tool-windows-x64.zip -Algorithm SHA256
+```
 
 ### Option B – Build locally on Windows
 

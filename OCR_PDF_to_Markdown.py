@@ -181,6 +181,48 @@ def crop_image(img: Image.Image, crop: Tuple[int, int, int, int]) -> Image.Image
     return img.crop((l, t, max(l + 1, width - r), max(t + 1, height - b)))
 
 
+def deskew_image(img: Image.Image) -> Tuple[Image.Image, float]:
+    """Estimate page skew from dark-pixel orientation and rotate to flat.
+
+    Returns (rotated_image, applied_angle_degrees). Skips rotation when the
+    estimated angle is < 0.25 degrees or OpenCV is unavailable.
+    """
+    if cv2 is None or np is None:
+        return img, 0.0
+    arr = np.array(img.convert("L"))
+    inv = 255 - arr if arr.mean() > 127 else arr
+    coords = np.column_stack(np.where(inv > 50))
+    if coords.shape[0] < 200:
+        return img, 0.0
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    if abs(angle) < 0.25:
+        return img, 0.0
+    h, w = arr.shape
+    matrix = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    rotated = cv2.warpAffine(
+        arr, matrix, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    return Image.fromarray(rotated), float(angle)
+
+
+def denoise_image(img: Image.Image) -> Image.Image:
+    """Apply non-local-means denoising suited for OCR. No-op without OpenCV."""
+    if cv2 is None or np is None:
+        return img
+    arr = np.array(img.convert("L"))
+    out = cv2.fastNlMeansDenoising(
+        arr, None, h=10, templateWindowSize=7, searchWindowSize=21
+    )
+    return Image.fromarray(out)
+
+
 def preprocess_image(
     img: Image.Image,
     grayscale: bool = True,
@@ -191,10 +233,18 @@ def preprocess_image(
     invert: bool = False,
     dilate: int = 0,
     erode: int = 0,
+    deskew: bool = False,
+    denoise: bool = False,
 ) -> Image.Image:
     """Condition an image for OCR.  Uses PIL by default; OpenCV when needed."""
     if grayscale:
         img = img.convert("L")
+
+    if denoise:
+        img = denoise_image(img)
+
+    if deskew:
+        img, _angle = deskew_image(img)
 
     if contrast and abs(contrast - 1.0) > 1e-6:
         img = ImageEnhance.Contrast(img).enhance(contrast)
@@ -269,6 +319,110 @@ def tesseract_words(
             )
         )
     return words
+
+
+def words_from_embedded_text(
+    page, render_scale: float, crop: Tuple[int, int, int, int] = (0, 0, 0, 0),
+) -> List[OCRWord]:
+    """Pull word-level bounding boxes from a PDF's embedded text layer.
+
+    Returns the same :class:`OCRWord` shape that Tesseract produces, so the
+    rest of the pipeline (row grouping, column-aware splitting,
+    :func:`rows_to_markdown`) can reuse it verbatim. Confidence is reported
+    as 100 because the words come straight from the PDF, not OCR.
+
+    Coordinates are scaled to match the rendered-image coordinate system
+    that downstream code expects, then offset by the crop's top/left so
+    crop-relative comparisons keep working.
+    """
+    words: List[OCRWord] = []
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return words
+
+    cl, ct, _cr, _cb = crop
+    for block in data.get("blocks", []):
+        if block.get("type", 0) != 0:  # 0 = text block, 1 = image
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = (span.get("text") or "").strip()
+                if not text:
+                    continue
+                bx = span.get("bbox") or [0, 0, 0, 0]
+                x0, y0, x1, y1 = bx
+                # bbox is in PDF points (1 pt = 1/72"). Scale to rendered px.
+                # Split a multi-word span into per-word boxes proportionally.
+                tokens = text.split()
+                if not tokens:
+                    continue
+                span_w_pts = max(0.001, x1 - x0)
+                total_chars = sum(len(t) for t in tokens) + max(0, len(tokens) - 1)
+                cursor = x0
+                for tok in tokens:
+                    frac = (len(tok) + 1) / total_chars if total_chars else 1 / len(tokens)
+                    tok_x0 = cursor
+                    tok_x1 = cursor + span_w_pts * frac
+                    cursor = tok_x1
+                    rx = int(tok_x0 * render_scale) - cl
+                    ry = int(y0 * render_scale) - ct
+                    rw = max(1, int((tok_x1 - tok_x0) * render_scale))
+                    rh = max(1, int((y1 - y0) * render_scale))
+                    words.append(OCRWord(
+                        text=tok, conf=100.0,
+                        x=rx, y=ry, w=rw, h=rh,
+                    ))
+    return words
+
+
+def tesseract_words_voting(
+    img: Image.Image, lang: str, oem: int, min_conf: float,
+    psms: Optional[Sequence[int]] = None,
+    user_psm: int = 6,
+) -> List[OCRWord]:
+    """Run Tesseract with multiple page-segmentation modes and pick the
+    result that found the most useful text.
+
+    The selector is ``word_count * min(avg_conf, 80) / 100`` rather than mean
+    confidence alone, because the old "highest mean conf" rule would prefer a
+    PSM that found *fewer* words in clean positions over one that found more
+    correct text with slightly noisier confidence.
+
+    If ``psms`` is omitted, the candidate set always includes ``user_psm``
+    so the user's PSM choice is respected, plus PSM 11 (sparse text) as a
+    complementary segmentation. PSM 4 is intentionally excluded — it treats
+    the page as one variable-width column and breaks the row/column table
+    reconstruction in :func:`rows_to_markdown`.
+    """
+    if psms is None:
+        complement = 11 if user_psm != 11 else 6
+        candidates = [user_psm, complement]
+    else:
+        candidates = list(psms)
+
+    seen: List[int] = []
+    for p in candidates:
+        if p not in seen:
+            seen.append(p)
+
+    best_words: List[OCRWord] = []
+    best_score: float = -1.0
+    for psm in seen:
+        try:
+            words = tesseract_words(img, lang, psm, oem, min_conf)
+        except Exception:
+            continue
+        if not words:
+            continue
+        avg_conf = sum(w.conf for w in words) / len(words)
+        # Cap conf contribution at 80 so a tiny set of 95-conf words can't
+        # outscore a larger set of solid 75-conf words.
+        score = len(words) * min(avg_conf, 80.0) / 100.0
+        if score > best_score:
+            best_score = score
+            best_words = words
+    return best_words
 
 
 # ===================================================================
@@ -552,6 +706,83 @@ def split_row_by_gaps(row: OCRRow, min_gap: int = 22) -> List[str]:
     return [normalize_cell(c) for c in cells if c.strip()]
 
 
+def _column_ranges_from_header(
+    header_row: OCRRow, min_gap: int = 22,
+) -> List[Tuple[int, int]]:
+    """Derive ``(left, right)`` X-pixel ranges, one per column, from a header
+    row. Uses the same gap-splitting logic as :func:`split_row_by_gaps`, but
+    operates on word bounding boxes so we can map data-row words back to the
+    correct column even when some cells are empty.
+
+    Boundary placement:
+      * The boundary between adjacent columns sits at the midpoint of the
+        white gap between the two header cells.
+      * The first column extends left to 0; the last column extends right to
+        a large sentinel — so words that drift past the visible header edges
+        still get bucketed.
+    """
+    words = sorted(header_row.words, key=lambda w: w.x)
+    if not words:
+        return []
+
+    # Group header words into cells (same heuristic as split_row_by_gaps but
+    # we keep the OCRWord objects so we know each cell's x-range).
+    cells: List[List[OCRWord]] = [[words[0]]]
+    for w in words[1:]:
+        if w.x - cells[-1][-1].x2 >= min_gap:
+            cells.append([w])
+        else:
+            cells[-1].append(w)
+
+    cell_bounds: List[Tuple[int, int]] = [
+        (cell[0].x, cell[-1].x2) for cell in cells
+    ]
+
+    ranges: List[Tuple[int, int]] = []
+    for i, (left, right) in enumerate(cell_bounds):
+        lo = 0 if i == 0 else (cell_bounds[i - 1][1] + left) // 2
+        hi = (10 ** 9
+              if i == len(cell_bounds) - 1
+              else (right + cell_bounds[i + 1][0]) // 2)
+        ranges.append((lo, hi))
+    return ranges
+
+
+def split_row_by_columns(
+    row: OCRRow, ranges: List[Tuple[int, int]],
+) -> List[str]:
+    """Bucket each word in ``row`` into the column whose X-range contains
+    the word's X-midpoint. Returns exactly ``len(ranges)`` normalised cell
+    strings, including empty strings for columns that contained no words.
+
+    This is the fix for the "blank cell shifts subsequent cells left" bug:
+    blank columns produce empty cells in the correct slot instead of being
+    silently dropped.
+    """
+    if not ranges:
+        return []
+    buckets: List[List[OCRWord]] = [[] for _ in ranges]
+    for w in sorted(row.words, key=lambda z: z.x):
+        x_mid = w.x + w.w // 2
+        placed = False
+        for i, (lo, hi) in enumerate(ranges):
+            if lo <= x_mid < hi:
+                buckets[i].append(w)
+                placed = True
+                break
+        if not placed:
+            # Outside every range (extremely rare given sentinel bounds).
+            # Snap to the nearest column edge.
+            distances = [
+                min(abs(x_mid - lo), abs(x_mid - hi)) for lo, hi in ranges
+            ]
+            buckets[distances.index(min(distances))].append(w)
+    return [
+        normalize_cell(" ".join(w.text for w in bucket).strip())
+        for bucket in buckets
+    ]
+
+
 def fix_header_tol(headers: List[str]) -> List[str]:
     """If headers contain '+TOL' and bare 'TOL' (not '-TOL'), fix the bare one."""
     has_plus = any(h.strip() == "+TOL" for h in headers)
@@ -721,8 +952,13 @@ def rows_to_markdown(
                 md.append(f"### {h}")
             pending_headings = []
 
-            headers = split_row_by_gaps(clean_rows[i], gap)
+            header_row = clean_rows[i]
+            headers = split_row_by_gaps(header_row, gap)
             headers = fix_header_tol(headers)
+            # Column ranges derived from the header row so data-row words
+            # snap to their actual column, preserving empty cells in the
+            # right slot instead of left-shifting everything.
+            column_ranges = _column_ranges_from_header(header_row, gap)
             table_data: List[List[str]] = []
             i += 1
 
@@ -741,7 +977,11 @@ def rows_to_markdown(
                 if is_fcf_label(next_text):
                     break
                 if looks_like_data_row(next_text):
-                    table_data.append(split_row_by_gaps(clean_rows[i], gap))
+                    if column_ranges:
+                        cells = split_row_by_columns(clean_rows[i], column_ranges)
+                    else:
+                        cells = split_row_by_gaps(clean_rows[i], gap)
+                    table_data.append(cells)
                     i += 1
                 else:
                     break

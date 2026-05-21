@@ -46,6 +46,8 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+_version_file = ROOT / 'pdf_ocr_gui_version_info.txt'
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -61,6 +63,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=str(_version_file) if _version_file.exists() else None,
 )
 
 coll = COLLECT(
